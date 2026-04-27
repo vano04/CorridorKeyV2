@@ -1,0 +1,433 @@
+diff --git a/losses/v3_matting_losses.py b/losses/v3_matting_losses.py
+index ecd9693..43717aa 100644
+--- a/losses/v3_matting_losses.py
++++ b/losses/v3_matting_losses.py
+@@ -21,59 +21,83 @@ import torch.nn.functional as F
+ EPS = 1e-6
+ 
+ 
++def _masked_mean(value: Tensor, mask: Optional[Tensor] = None) -> Tensor:
++    """Mean over unmasked support, expanding singleton channels if needed."""
++    value = value.float()
++    if mask is None:
++        return value.mean()
++
++    mask = mask.to(device=value.device, dtype=value.dtype)
++    if mask.shape != value.shape:
++        mask = mask.expand_as(value)
++    return (value * mask).sum() / mask.sum().clamp_min(1.0)
++
++
+ def _laplacian_pyramid_loss(
+     pred: Tensor,
+     target: Tensor,
+     levels: int = 5,
+     mask: Optional[Tensor] = None,
+ ) -> Tensor:
+-    """Multi-scale Laplacian pyramid L1 loss."""
+-    total = torch.tensor(0.0, device=pred.device, dtype=torch.float32)
++    """Multi-scale Laplacian pyramid L1 loss.
++
++    The finest residual receives the largest weight. Coarser residuals and the
++    final low-frequency residual are decayed and normalized so this term cannot
++    explode simply because a constant alpha offset reaches the coarsest level.
++    """
++    total = pred.new_tensor(0.0, dtype=torch.float32)
++    weight_sum = pred.new_tensor(0.0, dtype=torch.float32)
+     current_pred = pred.float()
+     current_target = target.float()
+-    current_mask = mask.float() if mask is not None else None
++    current_mask = mask.to(device=pred.device, dtype=torch.float32) if mask is not None else None
+     weight = 1.0
++
+     for _ in range(levels):
+         # Cannot downsample further once a spatial dimension reaches 1.
+         if current_pred.shape[-2] < 2 or current_pred.shape[-1] < 2:
+             break
+-        # Downsample
++
+         pred_down = F.avg_pool2d(current_pred, 2, stride=2)
+         target_down = F.avg_pool2d(current_target, 2, stride=2)
+-        # Upsample back
++
+         pred_up = F.interpolate(pred_down, size=current_pred.shape[-2:], mode="bilinear", align_corners=False)
+         target_up = F.interpolate(target_down, size=current_target.shape[-2:], mode="bilinear", align_corners=False)
+-        # Laplacian = current - upsampled(downsampled)
+-        lap_pred = current_pred - pred_up
+-        lap_target = current_target - target_up
+-        if current_mask is None:
+-            total = total + weight * (lap_pred - lap_target).abs().mean()
+-        else:
+-            diff = (lap_pred - lap_target).abs() * current_mask
+-            total = total + weight * (diff.sum() / current_mask.sum().clamp_min(1.0))
+-            current_mask = F.interpolate(current_mask, size=pred_down.shape[-2:], mode="nearest")
++
++        lap_diff = (current_pred - pred_up) - (current_target - target_up)
++        total = total + weight * _masked_mean(lap_diff.abs(), current_mask)
++        weight_sum = weight_sum + weight
++
+         current_pred = pred_down
+         current_target = target_down
+-        weight *= 2.0
+-    # Coarsest level L1
+-    if current_mask is None:
+-        total = total + weight * (current_pred - current_target).abs().mean()
+-    else:
+-        coarse_diff = (current_pred - current_target).abs() * current_mask
+-        total = total + weight * (coarse_diff.sum() / current_mask.sum().clamp_min(1.0))
+-    return total
++        if current_mask is not None:
++            # Area downsampling preserves soft transition masks better than
++            # nearest-neighbour aliasing, which can randomly drop thin bands.
++            current_mask = F.interpolate(current_mask, size=pred_down.shape[-2:], mode="area")
++        weight *= 0.5
+ 
++    total = total + weight * _masked_mean((current_pred - current_target).abs(), current_mask)
++    weight_sum = weight_sum + weight
++    return total / weight_sum.clamp_min(EPS)
+ 
+-def _temporal_gradient_loss(pred: Tensor, target: Tensor) -> Tensor:
++
++def _temporal_gradient_loss(
++    pred: Tensor,
++    target: Tensor,
++    valid_mask: Optional[Tensor] = None,
++) -> Tensor:
+     """Penalise temporal gradient mismatch: d/dt(pred) vs d/dt(target).
+ 
+     pred, target: [B, T, C, H, W]
++    valid_mask: optional [B, T]; a pair is valid only if both frames are valid.
+     """
+     if pred.shape[1] < 2:
+         return torch.tensor(0.0, device=pred.device, dtype=torch.float32)
+     dp = pred[:, 1:] - pred[:, :-1]
+     dt = target[:, 1:] - target[:, :-1]
+-    return (dp.float() - dt.float()).abs().mean()
++    pair_mask = None
++    if valid_mask is not None:
++        pair_mask = (valid_mask[:, 1:] * valid_mask[:, :-1])[:, :, None, None, None]
++    return _masked_mean((dp.float() - dt.float()).abs(), pair_mask)
+ 
+ 
+ def _soft_alpha_band_mask(alpha_gt: Tensor, lo: float = 0.02, hi: float = 0.98) -> Tensor:
+@@ -165,6 +189,7 @@ def _composite_random_bg_loss(
+     alpha_gt: Tensor,
+     fg_gt: Tensor,
+     fg_representation: str,
++    valid_mask: Optional[Tensor] = None,
+ ) -> Tensor:
+     """Composite pred and GT over same random background, compare."""
+     b, t, _, h, w = alpha_pred.shape
+@@ -178,7 +203,10 @@ def _composite_random_bg_loss(
+         comp_pred = fg_pred + (1.0 - alpha_pred) * rand_bg
+         comp_gt = fg_gt + (1.0 - alpha_gt) * rand_bg
+ 
+-    return (comp_pred.float() - comp_gt.float()).abs().mean()
++    mask = None
++    if valid_mask is not None:
++        mask = valid_mask[:, :, None, None, None]
++    return _masked_mean((comp_pred.float() - comp_gt.float()).abs(), mask)
+ 
+ 
+ class V3MattingLossComputer(nn.Module):
+@@ -262,12 +290,13 @@ class V3MattingLossComputer(nn.Module):
+ 
+         # Valid mask weighting
+         if valid_mask is not None:
+-            vmask = valid_mask[:, :, None, None, None].to(dtype=torch.float32)
++            valid_mask = valid_mask.to(device=device, dtype=torch.float32)
++            vmask: Optional[Tensor] = valid_mask[:, :, None, None, None]
+         else:
+-            vmask = 1.0
++            vmask = None
+ 
+         # Alpha L1
+-        l_alpha_l1 = ((alpha_p - alpha_g).abs() * vmask).mean()
++        l_alpha_l1 = _masked_mean((alpha_p - alpha_g).abs(), vmask)
+         items["alpha_l1"] = l_alpha_l1
+ 
+         # Alpha Laplacian
+@@ -289,14 +318,16 @@ class V3MattingLossComputer(nn.Module):
+         items["alpha_lap"] = l_alpha_lap
+ 
+         # FG L1 (only where alpha > 0)
+-        fg_mask = (alpha_g > 0.01).to(torch.float32) * vmask
+-        l_fg_l1 = ((fg_p - fg_g).abs() * fg_mask).sum() / fg_mask.sum().clamp_min(1.0)
++        fg_mask = (alpha_g > 0.01).to(torch.float32)
++        if vmask is not None:
++            fg_mask = fg_mask * vmask
++        l_fg_l1 = _masked_mean((fg_p - fg_g).abs(), fg_mask)
+         items["fg_l1"] = l_fg_l1
+ 
+         # Composite L1
+         comp_gt = batch.get("input_gt", batch.get("video_rgb"))
+         if comp_gt is not None:
+-            l_comp = ((comp_pred.float() - comp_gt.float()).abs() * vmask).mean()
++            l_comp = _masked_mean((comp_pred.float() - comp_gt.float()).abs(), vmask)
+         else:
+             l_comp = torch.tensor(0.0, device=device)
+         items["comp_l1"] = l_comp
+@@ -304,7 +335,9 @@ class V3MattingLossComputer(nn.Module):
+         # --- V3-specific losses ---
+ 
+         # Soft alpha band losses
+-        band_mask = _soft_alpha_band_mask(alpha_g) * vmask
++        band_mask = _soft_alpha_band_mask(alpha_g)
++        if vmask is not None:
++            band_mask = band_mask * vmask
+         band_count = band_mask.sum().clamp_min(1.0)
+         l_band_l1 = ((alpha_p - alpha_g).abs() * band_mask).sum() / band_count
+         items["alpha_band_l1"] = l_band_l1
+@@ -321,20 +354,21 @@ class V3MattingLossComputer(nn.Module):
+ 
+         # Temporal coherence
+         if self._enabled(self.w_temporal_alpha):
+-            l_temporal_alpha = _temporal_gradient_loss(alpha_pred, alpha_gt)
++            l_temporal_alpha = _temporal_gradient_loss(alpha_pred, alpha_gt, valid_mask)
+         else:
+             l_temporal_alpha = self._zero(device)
+         items["temporal_alpha"] = l_temporal_alpha
+ 
+         if self._enabled(self.w_temporal_fg):
+-            l_temporal_fg = _temporal_gradient_loss(fg_pred * (alpha_gt > 0.01).float(), fg_gt * (alpha_gt > 0.01).float())
++            fg_temporal_mask = (alpha_gt > 0.01).float()
++            l_temporal_fg = _temporal_gradient_loss(fg_pred * fg_temporal_mask, fg_gt * fg_temporal_mask, valid_mask)
+         else:
+             l_temporal_fg = self._zero(device)
+         items["temporal_fg"] = l_temporal_fg
+ 
+         # Composite with random background
+         if self._enabled(self.w_comp_random_bg):
+-            l_comp_rand = _composite_random_bg_loss(alpha_pred, fg_pred, alpha_gt, fg_gt, self.fg_representation)
++            l_comp_rand = _composite_random_bg_loss(alpha_pred, fg_pred, alpha_gt, fg_gt, self.fg_representation, valid_mask)
+         else:
+             l_comp_rand = self._zero(device)
+         items["comp_random_bg"] = l_comp_rand
+@@ -348,6 +382,8 @@ class V3MattingLossComputer(nn.Module):
+             )).clamp_min(0.0) * batch["alpha_boundary_gt"]
+             spill_gt = (green_excess > 0.03).to(torch.float32)
+             spill_weight = torch.ones_like(alpha_g)
++            if vmask is not None:
++                spill_weight = spill_weight * vmask
+             if self.spill_transition_only:
+                 transition = (
+                     (alpha_g > self.spill_transition_low)
+@@ -358,7 +394,7 @@ class V3MattingLossComputer(nn.Module):
+                 opaque_fg = (alpha_g > self.spill_opaque_alpha_thresh).to(alpha_g.dtype)
+                 spill_weight = spill_weight * (1.0 - opaque_fg)
+             # Use a non-autocast context for BCE because it's considered unsafe under FP8 autocast
+-            with torch.amp.autocast(device_type="cuda", enabled=False):
++            with torch.amp.autocast(device_type=device.type, enabled=False):
+                 spill_bce = F.binary_cross_entropy(
+                     pred["spill_mask_pred"].float().clamp(1e-6, 1.0 - 1e-6),
+                     spill_gt.float(),
+@@ -379,6 +415,8 @@ class V3MattingLossComputer(nn.Module):
+                 green_margin=float(self.weights.get("green_fg_margin", 0.08)),
+                 min_saturation=float(self.weights.get("green_fg_min_saturation", 0.10)),
+             )
++            if vmask is not None:
++                green_fg = green_fg * vmask
+             green_den = green_fg.sum().clamp_min(1.0)
+             green_fg_pixels = green_fg.mean().detach()
+ 
+@@ -408,6 +446,8 @@ class V3MattingLossComputer(nn.Module):
+                 green_margin=float(self.weights.get("green_bg_margin", 0.08)),
+                 min_saturation=float(self.weights.get("green_bg_min_saturation", 0.10)),
+             )
++            if vmask is not None:
++                green_bg = green_bg * vmask
+             green_bg_den = green_bg.sum().clamp_min(1.0)
+             green_bg_pixels = green_bg.mean().detach()
+             l_green_bg_alpha_suppress = (green_bg * alpha_p).sum() / green_bg_den
+@@ -419,33 +459,41 @@ class V3MattingLossComputer(nn.Module):
+         # Coarse prediction supervision
+         l_coarse_alpha = torch.tensor(0.0, device=device)
+         if self._enabled(self.w_coarse_alpha) and "coarse_alpha_pred" in pred:
+-            l_coarse_alpha = ((pred["coarse_alpha_pred"].float() - alpha_g).abs() * vmask).mean()
++            l_coarse_alpha = _masked_mean((pred["coarse_alpha_pred"].float() - alpha_g).abs(), vmask)
+         items["coarse_alpha_l1"] = l_coarse_alpha
+ 
+         l_coarse_fg = torch.tensor(0.0, device=device)
+         if self._enabled(self.w_coarse_fg) and "coarse_fg_pred" in pred:
+-            l_coarse_fg = ((pred["coarse_fg_pred"].float() - fg_g).abs() * fg_mask).sum() / fg_mask.sum().clamp_min(1.0)
++            l_coarse_fg = _masked_mean((pred["coarse_fg_pred"].float() - fg_g).abs(), fg_mask)
+         items["coarse_fg_l1"] = l_coarse_fg
+ 
+         # Native refiner regularisation (penalise large deltas)
+         l_delta_alpha = torch.tensor(0.0, device=device)
+         if self._enabled(self.w_native_alpha_delta) and "native_alpha_delta_pred" in pred:
+-            l_delta_alpha = pred["native_alpha_delta_pred"].float().abs().mean()
++            l_delta_alpha = _masked_mean(pred["native_alpha_delta_pred"].float().abs(), vmask)
+         items["native_alpha_delta_reg"] = l_delta_alpha
+ 
+         l_delta_fg = torch.tensor(0.0, device=device)
+         if self._enabled(self.w_native_fg_delta) and "native_fg_delta_pred" in pred:
+-            l_delta_fg = pred["native_fg_delta_pred"].float().abs().mean()
++            l_delta_fg = _masked_mean(pred["native_fg_delta_pred"].float().abs(), vmask)
+         items["native_fg_delta_reg"] = l_delta_fg
+ 
++        # Uncertainty calibration: predict current final alpha absolute error.
++        l_uncertainty = torch.tensor(0.0, device=device)
++        if self._enabled(self.w_uncertainty) and "uncertainty_pred" in pred:
++            with torch.no_grad():
++                uncertainty_target = (alpha_p - alpha_g).abs().clamp(0.0, 1.0)
++            l_uncertainty = _masked_mean((pred["uncertainty_pred"].float() - uncertainty_target).abs(), vmask)
++        items["uncertainty"] = l_uncertainty
++
+         # Quality eval
+         l_quality = torch.tensor(0.0, device=device)
+-        if self._enabled(self.w_quality_eval) and "quality_eval_pred" in pred:
++        if self._enabled(self.w_quality_eval) and "quality_eval_pred" in pred and "coarse_alpha_pred" in pred:
+             # Target: per-pixel error of the coarse alpha prediction
+             with torch.no_grad():
+                 coarse_error = (pred["coarse_alpha_pred"].float() - alpha_g).abs()
+                 quality_target = coarse_error.clamp(0.0, 1.0)
+-            l_quality = (pred["quality_eval_pred"].float() - quality_target).abs().mean()
++            l_quality = _masked_mean((pred["quality_eval_pred"].float() - quality_target).abs(), vmask)
+         items["quality_eval"] = l_quality
+ 
+         # --- Total ---
+@@ -467,6 +515,7 @@ class V3MattingLossComputer(nn.Module):
+             + self.w_coarse_fg * l_coarse_fg
+             + self.w_native_alpha_delta * l_delta_alpha
+             + self.w_native_fg_delta * l_delta_fg
++            + self.w_uncertainty * l_uncertainty
+             + self.w_quality_eval * l_quality
+         )
+ 
+diff --git a/tests/test_v3_loss_smoke.py b/tests/test_v3_loss_smoke.py
+index 0eb08e9..8ea877b 100644
+--- a/tests/test_v3_loss_smoke.py
++++ b/tests/test_v3_loss_smoke.py
+@@ -122,7 +122,7 @@ def test_all_loss_components_present(model_and_device):
+         "total", "alpha_l1", "alpha_lap", "fg_l1", "comp_l1",
+         "alpha_band_l1", "alpha_band_lap", "temporal_alpha", "temporal_fg",
+         "comp_random_bg", "coarse_alpha_l1", "coarse_fg_l1",
+-        "native_alpha_delta_reg", "native_fg_delta_reg", "quality_eval",
++        "native_alpha_delta_reg", "native_fg_delta_reg", "uncertainty", "quality_eval",
+         "green_bg_alpha_suppress", "green_bg_alpha_suppress_abs", "green_bg_pixels",
+     }
+     for k in expected_keys:
+@@ -190,6 +190,31 @@ def test_laplacian_loss_handles_small_spatial_sizes():
+     assert torch.isfinite(l_1)
+ 
+ 
++
++
++def test_laplacian_loss_does_not_amplify_constant_offsets():
++    x = torch.zeros(2, 1, 64, 64)
++    y = torch.ones(2, 1, 64, 64)
++
++    loss = _laplacian_pyramid_loss(x, y, levels=5)
++
++    assert torch.isfinite(loss)
++    assert loss <= 1.0
++
++
++def test_laplacian_loss_preserves_thin_soft_mask_support():
++    x = torch.zeros(1, 1, 64, 64)
++    y = torch.zeros_like(x)
++    y[:, :, 31:33, :] = 1.0
++    mask = torch.zeros_like(x)
++    mask[:, :, 31:33, :] = 1.0
++
++    loss = _laplacian_pyramid_loss(x, y, levels=5, mask=mask)
++
++    assert torch.isfinite(loss)
++    assert loss > 0
++
++
+ def test_alpha_lap_valid_mask_is_normalized_over_valid_support():
+     criterion = V3MattingLossComputer(
+         weights={
+@@ -247,3 +272,90 @@ def test_alpha_lap_valid_mask_is_normalized_over_valid_support():
+     assert torch.isfinite(items_all["alpha_lap"])
+     assert torch.isfinite(items_half["alpha_lap"])
+     assert torch.isclose(items_all["alpha_lap"], items_half["alpha_lap"], rtol=1e-5, atol=1e-6)
++
++
++def test_masked_losses_are_normalized_over_valid_frames():
++    criterion = V3MattingLossComputer(
++        weights={
++            "alpha_l1": 1.0,
++            "alpha_laplacian": 0.0,
++            "fg_l1": 1.0,
++            "comp_l1": 1.0,
++            "alpha_band_l1": 0.0,
++            "alpha_band_laplacian": 0.0,
++            "temporal_alpha_gradient": 0.0,
++            "temporal_fg_gradient": 0.0,
++            "comp_random_bg": 0.0,
++            "spill_l1": 0.0,
++            "green_fg_alpha": 0.0,
++            "green_fg_color": 0.0,
++            "green_bg_alpha_suppress": 0.0,
++            "coarse_alpha_l1": 0.0,
++            "coarse_fg_l1": 0.0,
++            "native_alpha_delta_reg": 0.0,
++            "native_fg_delta_reg": 0.0,
++            "uncertainty": 0.0,
++            "quality_eval": 0.0,
++        },
++        fg_representation="premul",
++    )
++
++    b, t, h, w = 1, 4, 8, 8
++    alpha_pred = torch.ones(b, t, 1, h, w)
++    alpha_gt = torch.zeros(b, t, 1, h, w)
++    fg_pred = torch.ones(b, t, 3, h, w)
++    fg_gt = torch.zeros(b, t, 3, h, w)
++    comp_pred = torch.ones(b, t, 3, h, w)
++    comp_gt = torch.zeros(b, t, 3, h, w)
++    pred = {"alpha_pred": alpha_pred, "fg_pred": fg_pred, "comp_pred": comp_pred}
++    base_batch = {"alpha_gt": alpha_gt, "fg_gt": fg_gt, "video_rgb": comp_gt, "input_gt": comp_gt}
++
++    _, items_all = criterion(pred, {**base_batch, "valid_mask": torch.tensor([[1.0, 1.0, 1.0, 1.0]])})
++    _, items_half = criterion(pred, {**base_batch, "valid_mask": torch.tensor([[1.0, 1.0, 0.0, 0.0]])})
++
++    for key in ("alpha_l1", "fg_l1", "comp_l1"):
++        assert torch.isclose(items_all[key], items_half[key], rtol=1e-5, atol=1e-6)
++
++
++def test_uncertainty_weight_contributes_to_total_when_prediction_exists():
++    criterion = V3MattingLossComputer(
++        weights={
++            "alpha_l1": 0.0,
++            "alpha_laplacian": 0.0,
++            "fg_l1": 0.0,
++            "comp_l1": 0.0,
++            "alpha_band_l1": 0.0,
++            "alpha_band_laplacian": 0.0,
++            "temporal_alpha_gradient": 0.0,
++            "temporal_fg_gradient": 0.0,
++            "comp_random_bg": 0.0,
++            "spill_l1": 0.0,
++            "green_fg_alpha": 0.0,
++            "green_fg_color": 0.0,
++            "green_bg_alpha_suppress": 0.0,
++            "coarse_alpha_l1": 0.0,
++            "coarse_fg_l1": 0.0,
++            "native_alpha_delta_reg": 0.0,
++            "native_fg_delta_reg": 0.0,
++            "uncertainty": 1.0,
++            "quality_eval": 0.0,
++        },
++        fg_representation="premul",
++    )
++
++    b, t, h, w = 1, 2, 4, 4
++    alpha_pred = torch.ones(b, t, 1, h, w)
++    alpha_gt = torch.zeros(b, t, 1, h, w)
++    fg = torch.zeros(b, t, 3, h, w)
++    pred = {
++        "alpha_pred": alpha_pred,
++        "fg_pred": fg,
++        "comp_pred": fg,
++        "uncertainty_pred": torch.zeros(b, t, 1, h, w),
++    }
++    batch = {"alpha_gt": alpha_gt, "fg_gt": fg, "video_rgb": fg, "input_gt": fg}
++
++    total, items = criterion(pred, batch)
++
++    assert items["uncertainty"] > 0
++    assert torch.isclose(total, items["uncertainty"])

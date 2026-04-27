@@ -1,0 +1,528 @@
+"""V3 hybrid video matting model.
+
+Fresh nn.Module — no inheritance from V1/V2. Self-contained three-branch
+architecture: global context + local tile encoder + native detail refiner.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+from contextlib import nullcontext
+
+import torch
+from torch import Tensor, nn
+import torch.nn.functional as F
+
+from .global_context import GlobalContextBranch
+from .local_tile_encoder import LocalTileEncoder
+from .native_detail_refiner import NativeDetailRefiner
+from .reference_memory import ReferenceMemoryBank
+from .heads import AlphaHead, ForegroundHead, UncertaintyHead, SpillMaskHead, QualityEvalHead
+from .positional import make_tile_coordinate_channels, make_default_tile_coords
+from .transformer_engine_utils import resolve_fp8_config, transformer_engine_available
+
+
+EPS = 1e-6
+FG_REPRESENTATIONS = {"premul", "straight"}
+
+
+def _validate_fg_representation(value: str) -> str:
+    rep = str(value).strip().lower()
+    if rep not in FG_REPRESENTATIONS:
+        raise ValueError(f"Unsupported fg_representation={value!r}")
+    return rep
+
+
+def _composite_fg(fg: Tensor, bg: Tensor, alpha: Tensor, representation: str) -> Tensor:
+    if representation == "straight":
+        return fg * alpha + (1.0 - alpha) * bg
+    return fg + (1.0 - alpha) * bg
+
+
+def _compute_padding(h: int, w: int, multiple: int) -> Tuple[int, int]:
+    return (multiple - h % multiple) % multiple, (multiple - w % multiple) % multiple
+
+
+def _safe_reflect_pad(x: Tensor, pad_w: int, pad_h: int) -> Tensor:
+    h, w = x.shape[-2], x.shape[-1]
+    if pad_h >= h or pad_w >= w:
+        return F.pad(x, (0, pad_w, 0, pad_h), mode="replicate")
+    return F.pad(x, (0, pad_w, 0, pad_h), mode="reflect")
+
+
+def _pad_video(video: Tensor, multiple: int) -> Tuple[Tensor, Tuple[int, int]]:
+    b, t, c, h, w = video.shape
+    pad_h, pad_w = _compute_padding(h, w, multiple)
+    if pad_h == 0 and pad_w == 0:
+        return video, (0, 0)
+    x = video.reshape(b * t, c, h, w)
+    x = _safe_reflect_pad(x, pad_w, pad_h)
+    return x.reshape(b, t, c, h + pad_h, w + pad_w), (pad_h, pad_w)
+
+
+def _unpad_video(video: Tensor, pad_hw: Tuple[int, int]) -> Tensor:
+    pad_h, pad_w = pad_hw
+    if pad_h == 0 and pad_w == 0:
+        return video
+    return video[..., :video.shape[-2] - pad_h, :video.shape[-1] - pad_w]
+
+
+def _resize_video(video: Tensor, out_hw: Tuple[int, int]) -> Tensor:
+    b, t, c, h, w = video.shape
+    x = video.reshape(b * t, c, h, w)
+    x = F.interpolate(x, size=out_hw, mode="bilinear", align_corners=False)
+    return x.reshape(b, t, c, out_hw[0], out_hw[1])
+
+
+def _boundary_band(alpha: Tensor, kernel_size: int = 3) -> Tensor:
+    bt = alpha.shape[0] * alpha.shape[1]
+    a = alpha.reshape(bt, 1, alpha.shape[-2], alpha.shape[-1])
+    dil = F.max_pool2d(a, kernel_size, stride=1, padding=kernel_size // 2)
+    ero = -F.max_pool2d(-a, kernel_size, stride=1, padding=kernel_size // 2)
+    band = (dil - ero).clamp(0.0, 1.0)
+    return band.reshape(alpha.shape[0], alpha.shape[1], 1, alpha.shape[-2], alpha.shape[-1])
+
+
+def _green_excess_map(rgb: Tensor) -> Tensor:
+    """Compute green excess: G - max(R, B), clamped to [0, 1]."""
+    g = rgb[:, :, 1:2]
+    r = rgb[:, :, 0:1]
+    b = rgb[:, :, 2:3]
+    return (g - torch.maximum(r, b)).clamp(0.0, 1.0)
+
+
+def _chroma_distance_map(rgb: Tensor, key_color: Tuple[float, float, float] = (0.0, 1.0, 0.0)) -> Tensor:
+    """Compute per-pixel chroma distance to key color."""
+    luma = 0.299 * rgb[:, :, 0:1] + 0.587 * rgb[:, :, 1:2] + 0.114 * rgb[:, :, 2:3]
+    chroma = rgb - luma
+    key = torch.tensor(key_color, device=rgb.device, dtype=rgb.dtype).view(1, 1, 3, 1, 1)
+    key_luma = 0.299 * key_color[0] + 0.587 * key_color[1] + 0.114 * key_color[2]
+    key_chroma = key - key_luma
+    diff = chroma - key_chroma
+    dist = (diff ** 2).sum(dim=2, keepdim=True).sqrt()
+    return dist.clamp(0.0, 1.0)
+
+
+def _unknown_band_from_hint(hint: Tensor, threshold: float = 0.02) -> Tensor:
+    """Mark uncertain regions from coarse alpha hint."""
+    return ((hint > threshold) & (hint < 1.0 - threshold)).to(hint.dtype)
+
+
+@dataclass
+class V3InferenceOptions:
+    mode: str = "full"
+    global_long_side_cap: int = 512
+    tile_size: int = 1024
+    tile_overlap: int = 64
+    refine_on_uncertainty: bool = True
+    refine_on_edges: bool = True
+    refine_on_spill_regions: bool = True
+
+
+class V3HybridVideoMattingModel(nn.Module):
+    """V3 three-branch hybrid matting model.
+
+    Branch 1: GlobalContextBranch — runs on downscaled full-frame, produces compact tokens
+    Branch 2: LocalTileEncoder — processes 1024x1024 tiles with extended inputs
+    Branch 3: NativeDetailRefiner — produces bounded residual deltas at native res
+    """
+
+    def __init__(
+        self,
+        # Patch / embedding
+        patch_size: int = 8,
+        embed_dims: Sequence[int] = (128, 256, 384, 512),
+        depths: Sequence[int] = (2, 2, 6, 2),
+        num_heads: Sequence[int] = (4, 8, 12, 16),
+        window_sizes: Sequence[int] = (8, 8, 4, 4),
+        memory_tokens: int = 64,
+        temporal_window: int = 5,
+        drop_path_rate: float = 0.1,
+        # Input channels
+        use_green_priors: bool = True,
+        use_coordinate_channels: bool = True,
+        use_unknown_band: bool = True,
+        guidance_presence_flag: bool = True,
+        green_prior_dropout: float = 0.0,
+        coarse_alpha_drop_prob: float = 0.0,
+        # Heads
+        predict_fg: bool = True,
+        predict_uncertainty: bool = True,
+        predict_spill_mask: bool = True,
+        predict_quality_eval: bool = True,
+        fg_representation: str = "premul",
+        # Global context
+        global_context_dim: int = 256,
+        global_context_layers: int = 4,
+        global_context_heads: int = 8,
+        global_context_tokens: int = 64,
+        use_global_fg_guidance: bool = False,
+        # Reference memory
+        use_reference_memory: bool = True,
+        reference_tokens_per_frame: int = 32,
+        num_reference_frames: int = 2,
+        reference_dropout: float = 0.25,
+        # Native detail refiner
+        use_native_refiner: bool = True,
+        native_refiner_blocks: int = 3,
+        native_refiner_hidden: int = 64,
+        native_refiner_chunk_frames: int = 2,
+        max_alpha_delta: float = 0.25,
+        max_fg_delta: float = 0.15,
+        max_spill_delta: float = 0.10,
+        # Performance
+        gradient_checkpointing: bool = False,
+        decoder_out_dim: int = 256,
+        # FP8 / Transformer Engine
+        fp8_cfg: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        super().__init__()
+
+        self.fp8_cfg = resolve_fp8_config({"fp8": fp8_cfg}) if fp8_cfg is not None else resolve_fp8_config({})
+
+        self.patch_size = patch_size
+        self.predict_fg = predict_fg
+        self.predict_uncertainty = predict_uncertainty
+        self.predict_spill_mask = predict_spill_mask
+        self.predict_quality_eval = predict_quality_eval
+        self.fg_representation = _validate_fg_representation(fg_representation)
+        self.use_green_priors = use_green_priors
+        self.use_coordinate_channels = use_coordinate_channels
+        self.use_unknown_band = use_unknown_band
+        self.guidance_presence_flag = guidance_presence_flag
+        self.use_global_fg_guidance = bool(use_global_fg_guidance)
+        self.green_prior_dropout = float(max(0.0, min(1.0, green_prior_dropout)))
+        self.coarse_alpha_drop_prob = float(max(0.0, min(1.0, coarse_alpha_drop_prob)))
+        self.use_native_refiner = use_native_refiner
+        self.use_reference_memory = use_reference_memory
+        self.native_refiner_chunk_frames = max(1, int(native_refiner_chunk_frames))
+
+        # Compute input channels for local tile encoder
+        in_ch = 4
+        if guidance_presence_flag:
+            in_ch += 1
+        if use_green_priors:
+            in_ch += 2
+        if use_unknown_band:
+            in_ch += 1
+        if use_coordinate_channels:
+            in_ch += 5
+        self.local_in_channels = in_ch
+
+        # Global context input
+        global_in_ch = 4
+        if use_green_priors:
+            global_in_ch += 2
+        if self.use_global_fg_guidance:
+            global_in_ch += 3
+
+        self.global_context = GlobalContextBranch(
+            in_channels=global_in_ch,
+            embed_dim=global_context_dim,
+            num_layers=global_context_layers,
+            num_heads=global_context_heads,
+            patch_size=patch_size,
+            memory_tokens=global_context_tokens,
+            gradient_checkpointing=gradient_checkpointing,
+            fp8_cfg=self.fp8_cfg,
+        )
+
+        self.local_encoder = LocalTileEncoder(
+            in_channels=in_ch,
+            patch_size=patch_size,
+            embed_dims=embed_dims,
+            depths=depths,
+            num_heads=num_heads,
+            window_sizes=window_sizes,
+            memory_tokens=memory_tokens,
+            temporal_window=temporal_window,
+            drop_path_rate=drop_path_rate,
+            gradient_checkpointing=gradient_checkpointing,
+            global_context_dim=global_context_dim,
+            decoder_out_dim=decoder_out_dim,
+            fp8_cfg=self.fp8_cfg,
+        )
+
+        if use_reference_memory:
+            self.reference_memory = ReferenceMemoryBank(
+                dim=embed_dims[-1],
+                num_reference_frames=num_reference_frames,
+                tokens_per_reference=reference_tokens_per_frame,
+                dropout=reference_dropout,
+            )
+        else:
+            self.reference_memory = None
+
+        self.alpha_head = AlphaHead(decoder_out_dim)
+        self.fg_head = ForegroundHead(decoder_out_dim) if predict_fg else None
+        self.uncertainty_head = UncertaintyHead(decoder_out_dim) if predict_uncertainty else None
+        self.spill_head = SpillMaskHead(decoder_out_dim) if predict_spill_mask else None
+        self.quality_eval_head = QualityEvalHead(decoder_out_dim) if predict_quality_eval else None
+
+        if use_native_refiner:
+            refiner_in = 3 + 1 + 3 + 1 + (1 if predict_spill_mask else 0)
+            self.native_refiner = NativeDetailRefiner(
+                in_channels=refiner_in,
+                hidden_channels=native_refiner_hidden,
+                num_blocks=native_refiner_blocks,
+                max_alpha_delta=max_alpha_delta,
+                max_fg_delta=max_fg_delta,
+                max_spill_delta=max_spill_delta,
+                predict_spill=predict_spill_mask,
+                global_context_dim=global_context_dim,
+            )
+        else:
+            self.native_refiner = None
+
+    def _build_local_input(self, video, coarse_alpha_init, tile_coords, source_hw):
+        b, t, _, h, w = video.shape
+        device = video.device
+        dtype = video.dtype
+        cond = torch.zeros(b, t, 1, h, w, device=device, dtype=dtype)
+        cond[:, 0] = coarse_alpha_init
+        parts = [video, cond]
+        if self.guidance_presence_flag:
+            flag = torch.zeros(b, t, 1, h, w, device=device, dtype=dtype); flag[:, 0] = 1.0; parts.append(flag)
+        if self.use_green_priors:
+            ge = _green_excess_map(video)
+            cd = _chroma_distance_map(video)
+            if self.training and self.green_prior_dropout > 0.0:
+                keep = (
+                    torch.rand((b, 1, 1, 1, 1), device=device)
+                    >= self.green_prior_dropout
+                ).to(dtype=dtype)
+                ge = ge * keep
+                cd = cd * keep
+            parts.append(ge)
+            parts.append(cd)
+        if self.use_unknown_band:
+            parts.append(_unknown_band_from_hint(cond))
+        if self.use_coordinate_channels:
+            if tile_coords is None or source_hw is None:
+                tile_coords, source_hw = make_default_tile_coords(b, h, w, device, dtype)
+            else:
+                tile_coords = tile_coords.to(device=device, dtype=dtype)
+                source_hw = source_hw.to(device=device, dtype=dtype)
+            coord_maps = make_tile_coordinate_channels(tile_coords, source_hw, h, w)
+            parts.append(coord_maps.unsqueeze(1).expand(b, t, -1, h, w))
+        return torch.cat(parts, dim=2)
+
+    def _build_global_input(self, global_video, global_coarse_alpha_init, global_fg_guidance: Optional[Tensor] = None):
+        b, t, _, h, w = global_video.shape
+        cond = torch.zeros(b, t, 1, h, w, device=global_video.device, dtype=global_video.dtype)
+        cond[:, 0] = global_coarse_alpha_init
+        fg_guidance = None
+        if self.use_global_fg_guidance:
+            if global_fg_guidance is not None:
+                fg_guidance = global_fg_guidance.to(device=global_video.device, dtype=global_video.dtype)
+            else:
+                fg_guidance = torch.zeros(
+                    b,
+                    t,
+                    3,
+                    h,
+                    w,
+                    device=global_video.device,
+                    dtype=global_video.dtype,
+                )
+        green_priors = None
+        if self.use_green_priors:
+            ge = _green_excess_map(global_video)
+            cd = _chroma_distance_map(global_video)
+            if self.training and self.green_prior_dropout > 0.0:
+                keep = (
+                    torch.rand((b, 1, 1, 1, 1), device=global_video.device)
+                    >= self.green_prior_dropout
+                ).to(dtype=global_video.dtype)
+                ge = ge * keep
+                cd = cd * keep
+            green_priors = torch.cat([ge, cd], dim=2)
+        return cond, green_priors, fg_guidance
+
+    def forward(
+        self,
+        video: Tensor,
+        coarse_alpha_init: Tensor,
+        valid_mask: Optional[Tensor] = None,
+        bg_for_comp: Optional[Tensor] = None,
+        inference_options: Optional[V3InferenceOptions] = None,
+        global_video: Optional[Tensor] = None,
+        global_coarse_alpha_init: Optional[Tensor] = None,
+        global_fg_guidance: Optional[Tensor] = None,
+        global_tokens: Optional[Tensor] = None,
+        ref_tokens: Optional[Tensor] = None,
+        tile_coords: Optional[Tensor] = None,
+        source_hw: Optional[Tensor] = None,
+    ) -> Dict[str, Tensor]:
+        b, t, _, h, w = video.shape
+        te = None
+        if self.fp8_cfg["enabled"] and self.fp8_cfg["backend"] == "transformer_engine":
+            try: import transformer_engine.pytorch as te
+            except ImportError: pass
+        fp8_context = te.fp8_autocast(enabled=True) if te is not None else nullcontext()
+
+        with fp8_context:
+            coarse_alpha_model = coarse_alpha_init
+            global_coarse_alpha_model = global_coarse_alpha_init
+            if self.training and self.coarse_alpha_drop_prob > 0.0:
+                drop = (
+                    torch.rand((b, 1, 1, 1), device=video.device)
+                    < self.coarse_alpha_drop_prob
+                )
+                coarse_alpha_model = torch.where(drop, torch.zeros_like(coarse_alpha_init), coarse_alpha_init)
+                if global_coarse_alpha_model is not None:
+                    global_drop = (
+                        torch.rand((b, 1, 1, 1), device=video.device)
+                        < self.coarse_alpha_drop_prob
+                    )
+                    global_coarse_alpha_model = torch.where(
+                        global_drop,
+                        torch.zeros_like(global_coarse_alpha_model),
+                        global_coarse_alpha_model,
+                    )
+
+            if global_tokens is None:
+                if global_video is not None and global_coarse_alpha_model is not None:
+                    c_bc, gp, fg_guidance = self._build_global_input(
+                        global_video,
+                        global_coarse_alpha_model,
+                        global_fg_guidance=global_fg_guidance,
+                    )
+                    global_tokens, _ = self.global_context(
+                        video_rgb_global=global_video,
+                        coarse_alpha_global=c_bc,
+                        green_priors_global=gp,
+                        fg_guidance_global=fg_guidance,
+                    )
+                else:
+                    c_bc, gp, fg_guidance = self._build_global_input(video, coarse_alpha_model)
+                    global_tokens, _ = self.global_context(
+                        video_rgb_global=video,
+                        coarse_alpha_global=c_bc,
+                        green_priors_global=gp,
+                        fg_guidance_global=fg_guidance,
+                    )
+
+            local_input = self._build_local_input(video, coarse_alpha_model, tile_coords, source_hw)
+            local_input, pad_hw = _pad_video(local_input, self.patch_size)
+            video_padded, _ = _pad_video(video, self.patch_size)
+            coarse_padded = coarse_alpha_model
+            if pad_hw[0] or pad_hw[1]:
+                coarse_padded = _safe_reflect_pad(coarse_alpha_model, pad_hw[1], pad_hw[0])
+
+            decoded, stage_feats = self.local_encoder(x=local_input, coarse_alpha_init=coarse_padded, video_rgb=video_padded, valid_mask=valid_mask, global_tokens=global_tokens)
+
+            if self.reference_memory is not None:
+                deepest, ref_tokens_out = self.reference_memory(stage_feats[-1], ref_tokens)
+                stage_feats[-1] = deepest
+                decoded = self.local_encoder.decoder(stage_feats)
+            else:
+                ref_tokens_out = ref_tokens
+
+            alpha_pred = self.alpha_head(decoded)
+            fg_pred = self.fg_head(decoded) if self.fg_head else torch.zeros_like(alpha_pred).expand(-1, 3, -1, -1)
+            uncertainty_pred = self.uncertainty_head(decoded) if self.uncertainty_head else None
+            spill_mask_pred = self.spill_head(decoded) if self.spill_head else None
+            quality_eval_pred = self.quality_eval_head(decoded) if self.quality_eval_head and self.training else None
+
+            target_h, target_w = h + pad_hw[0], w + pad_hw[1]
+            if alpha_pred.shape[-2:] != (target_h, target_w):
+                alpha_pred = F.interpolate(alpha_pred, size=(target_h, target_w), mode="bilinear", align_corners=False)
+                fg_pred = F.interpolate(fg_pred, size=(target_h, target_w), mode="bilinear", align_corners=False)
+                if uncertainty_pred is not None: uncertainty_pred = F.interpolate(uncertainty_pred, size=(target_h, target_w), mode="bilinear", align_corners=False)
+                if spill_mask_pred is not None: spill_mask_pred = F.interpolate(spill_mask_pred, size=(target_h, target_w), mode="bilinear", align_corners=False)
+                if quality_eval_pred is not None: quality_eval_pred = F.interpolate(quality_eval_pred, size=(target_h, target_w), mode="bilinear", align_corners=False)
+
+            alpha_pred = _unpad_video(alpha_pred.reshape(b, t, 1, target_h, target_w), pad_hw)
+            fg_pred = _unpad_video(fg_pred.reshape(b, t, 3, target_h, target_w), pad_hw)
+            if uncertainty_pred is not None: uncertainty_pred = _unpad_video(uncertainty_pred.reshape(b, t, 1, target_h, target_w), pad_hw)
+            if spill_mask_pred is not None: spill_mask_pred = _unpad_video(spill_mask_pred.reshape(b, t, 1, target_h, target_w), pad_hw)
+            if quality_eval_pred is not None: quality_eval_pred = _unpad_video(quality_eval_pred.reshape(b, t, 1, target_h, target_w), pad_hw)
+
+            coarse_alpha_pred, coarse_fg_pred, coarse_spill_pred = alpha_pred, fg_pred, spill_mask_pred
+
+            if self.native_refiner is not None:
+                refine_mask_full = _boundary_band(alpha_pred)
+                if uncertainty_pred is not None:
+                    refine_mask_full = torch.maximum(refine_mask_full, uncertainty_pred)
+                refine_mask_full = refine_mask_full.clamp(0, 1)
+
+                chunk_frames = max(1, min(self.native_refiner_chunk_frames, t))
+                refiner_chunks: Dict[str, List[Tensor]] = {}
+
+                for t0 in range(0, t, chunk_frames):
+                    t1 = min(t, t0 + chunk_frames)
+                    tc = t1 - t0
+                    refiner_out_c = self.native_refiner(
+                        rgb=video[:, t0:t1].reshape(b * tc, 3, h, w),
+                        coarse_alpha=alpha_pred[:, t0:t1].reshape(b * tc, 1, h, w),
+                        coarse_fg=fg_pred[:, t0:t1].reshape(b * tc, 3, h, w),
+                        uncertainty=(uncertainty_pred[:, t0:t1].reshape(b * tc, 1, h, w) if uncertainty_pred is not None else None),
+                        coarse_spill=(spill_mask_pred[:, t0:t1].reshape(b * tc, 1, h, w) if spill_mask_pred is not None else None),
+                        refine_mask=refine_mask_full[:, t0:t1].reshape(b * tc, 1, h, w),
+                        global_tokens=global_tokens,
+                    )
+                    for key, value in refiner_out_c.items():
+                        c = value.shape[1]
+                        refiner_chunks.setdefault(key, []).append(value.reshape(b, tc, c, h, w))
+
+                refiner_out = {key: torch.cat(values, dim=1) for key, values in refiner_chunks.items()}
+                alpha_pred, fg_pred = refiner_out["alpha_refined"], refiner_out["fg_refined"]
+                if "spill_refined" in refiner_out: spill_mask_pred = refiner_out["spill_refined"]
+                refine_mask = refine_mask_full.reshape(b*t, 1, h, w)
+
+            comp_pred = _composite_fg(fg_pred, bg_for_comp if bg_for_comp is not None else video, alpha_pred, self.fg_representation)
+
+            out = {"alpha_pred": alpha_pred, "fg_pred": fg_pred, "comp_pred": comp_pred, "ref_tokens": ref_tokens_out, "coarse_alpha_pred": coarse_alpha_pred, "coarse_fg_pred": coarse_fg_pred}
+            if uncertainty_pred is not None: out["uncertainty_pred"] = uncertainty_pred
+            if spill_mask_pred is not None: out["spill_mask_pred"] = spill_mask_pred
+            if quality_eval_pred is not None: out["quality_eval_pred"] = quality_eval_pred
+            if self.native_refiner is not None:
+                out.update({"native_alpha_delta_pred": refiner_out["native_alpha_delta_pred"], "native_fg_delta_pred": refiner_out["native_fg_delta_pred"], "refine_mask": refine_mask.reshape(b, t, 1, h, w)})
+            return out
+
+
+def build_v3_hybrid_video_matting_model(config: Dict[str, Any]) -> V3HybridVideoMattingModel:
+    return V3HybridVideoMattingModel(
+        patch_size=int(config.get("patch_size", 8)),
+        embed_dims=tuple(config.get("embed_dims", [128, 256, 384, 512])),
+        depths=tuple(config.get("depths", [2, 2, 6, 2])),
+        num_heads=tuple(config.get("num_heads", [4, 8, 12, 16])),
+        window_sizes=tuple(config.get("window_sizes", [8, 8, 4, 4])),
+        memory_tokens=int(config.get("memory_tokens", 64)),
+        temporal_window=int(config.get("temporal_window", 5)),
+        drop_path_rate=float(config.get("drop_path_rate", 0.1)),
+        use_green_priors=bool(config.get("use_green_priors", True)),
+        use_coordinate_channels=bool(config.get("use_coordinate_channels", True)),
+        use_unknown_band=bool(config.get("use_unknown_band", True)),
+        guidance_presence_flag=bool(config.get("guidance_presence_flag", True)),
+        green_prior_dropout=float(config.get("green_prior_dropout", 0.0)),
+        coarse_alpha_drop_prob=float(config.get("coarse_alpha_drop_prob", 0.0)),
+        predict_fg=bool(config.get("predict_fg", True)),
+        predict_uncertainty=bool(config.get("predict_uncertainty", True)),
+        predict_spill_mask=bool(config.get("predict_spill_mask", True)),
+        predict_quality_eval=bool(config.get("predict_quality_eval", True)),
+        fg_representation=str(config.get("fg_representation", "premul")),
+        global_context_dim=int(config.get("global_context_dim", 256)),
+        global_context_layers=int(config.get("global_context_layers", 4)),
+        global_context_heads=int(config.get("global_context_heads", 8)),
+        global_context_tokens=int(config.get("global_context_tokens", 64)),
+        use_global_fg_guidance=bool(config.get("use_global_fg_guidance", False)),
+        use_reference_memory=bool(config.get("use_reference_memory", True)),
+        reference_tokens_per_frame=int(config.get("reference_tokens_per_frame", 32)),
+        num_reference_frames=int(config.get("num_reference_frames", 2)),
+        reference_dropout=float(config.get("reference_dropout", 0.25)),
+        use_native_refiner=bool(config.get("use_native_refiner", True)),
+        native_refiner_blocks=int(config.get("native_refiner_blocks", 3)),
+        native_refiner_hidden=int(config.get("native_refiner_hidden", 64)),
+        native_refiner_chunk_frames=int(config.get("native_refiner_chunk_frames", 2)),
+        max_alpha_delta=float(config.get("native_refiner_max_alpha_delta", config.get("max_alpha_delta", 0.25))),
+        max_fg_delta=float(config.get("native_refiner_max_fg_delta", config.get("max_fg_delta", 0.15))),
+        max_spill_delta=float(config.get("native_refiner_max_spill_delta", config.get("max_spill_delta", 0.10))),
+        gradient_checkpointing=bool(config.get("gradient_checkpointing", False)),
+        decoder_out_dim=int(config.get("decoder_out_dim", 256)),
+        fp8_cfg=config.get("fp8"),
+    )
+
+def build_memory_guided_video_matting_model(config: Dict[str, Any]) -> V3HybridVideoMattingModel:
+    return build_v3_hybrid_video_matting_model(config)

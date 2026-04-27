@@ -1,0 +1,157 @@
+# V3 single-card RTX 5090 config with FP8 via Transformer Engine
+# 1024px global context variant for higher-res UHD clips
+#
+# Single GPU path for RTX 5090 with FP8 on transformer-heavy blocks.
+# Alpha/FG/spill heads and loss computations remain in bf16/fp32.
+# Global context resolution increased from 512px to 1024px for better spatial detail.
+
+model:
+  patch_size: 8
+  embed_dims: [128, 256, 384, 512]
+  depths: [2, 2, 6, 2]
+  num_heads: [4, 8, 12, 16]
+  window_sizes: [8, 8, 4, 4]
+  memory_tokens: 64
+  temporal_window: 5
+  drop_path_rate: 0.1
+  gradient_checkpointing: false
+  decoder_out_dim: 256
+
+  # V3 features
+  use_green_priors: true
+  use_coordinate_channels: true
+  use_unknown_band: true
+  guidance_presence_flag: true
+  green_prior_dropout: 0.10
+  coarse_alpha_drop_prob: 0.05
+  predict_fg: true
+  predict_uncertainty: true
+  predict_spill_mask: true
+  predict_quality_eval: true
+  fg_representation: premul
+
+  # Global context
+  global_context_dim: 256
+  global_context_layers: 4
+  global_context_heads: 8
+  global_context_tokens: 64
+  use_global_fg_guidance: true
+
+  # Reference memory
+  use_reference_memory: true
+  reference_tokens_per_frame: 32
+  num_reference_frames: 2
+  reference_dropout: 0.25
+
+  # Native refiner
+  use_native_refiner: true
+  native_refiner_blocks: 2
+  native_refiner_hidden: 48
+  native_refiner_chunk_frames: 8
+  native_refiner_max_alpha_delta: 0.03
+  native_refiner_max_fg_delta: 0.02
+  native_refiner_max_spill_delta: 0.15
+
+  # FP8 via Transformer Engine (single-card only!)
+  fp8:
+    enabled: false
+    backend: transformer_engine
+    use_te_linear: true
+    use_te_attention: true
+    exclude_heads: true
+    exclude_native_refiner: true
+    fp8_recipe: delayed_scaling
+
+data:
+  root_dir: "CorridorKeyDataset"
+  multi_resolution_buckets: [384, 512]
+  batch_size_per_gpu: 1
+  clip_len_min: 8
+  clip_len_max: 8
+  fixed_crop_size: 512
+  fg_representation: premul
+  device_augment: true
+  host_dtype: bf16
+  num_torch_threads: 1
+  horizontal_flip_p: 0.5
+  background_replace_p: 0.3
+  spill_augment_p: 0.4
+  green_foreground_prob: 0.0
+  green_foreground_strength_min: 0.10
+  green_foreground_strength_max: 0.35
+  green_foreground_alpha_thresh: 0.985
+  coarse_alpha_drop_prob: 0.05
+
+  decode_full_frame: false
+  emit_global_context: true
+  global_context_long_side: 1024
+  exr_tile_size: 256
+  local_tile_span: 4
+  source_hw: [2048, 2048]
+  exr_internal_threads: 0
+  exr_decode_threads: 3
+  emit_tile_metadata: true
+  decode_global_context: false
+  global_context_modalities: [Input, Alpha, FG]
+  num_workers: 6
+  prefetch_factor: 3
+  persistent_workers: true
+  pin_memory: true
+train:
+  epochs: 40
+  lr: 5.0e-6
+  weight_decay: 0.01
+  warmup_steps: 0
+  min_lr_ratio: 0.1
+  amp: true
+  amp_dtype: bf16
+  grad_clip: 1.0
+  fused_adamw: true
+  log_interval: 20
+  save_interval: 1
+  inference_mode: hybrid
+  temporal_batch_size: 8
+  debug_console: true
+  grad_accum_steps: 1
+
+  compile: false
+  compile_dynamic: true
+  cuda_warmup: false
+  cuda_prefetch: true
+  cuda_prefetch_queue: 3
+loss:
+  alpha_l1: 1.0
+  alpha_laplacian: 1.0
+  fg_l1: 1.0
+  comp_l1: 1.0
+  alpha_band_l1: 0.5
+  alpha_band_laplacian: 0.5
+  temporal_alpha_gradient: 0.3
+  temporal_fg_gradient: 0.15
+  comp_random_bg: 0.3
+  spill_l1: 0.25
+  spill_transition_only: true
+  spill_transition_low: 0.02
+  spill_transition_high: 0.98
+  spill_exclude_opaque_fg: true
+  spill_opaque_alpha_thresh: 0.90
+  green_fg_alpha: 0.10
+  green_fg_color: 0.00
+  green_fg_alpha_thresh: 0.985
+  green_fg_margin: 0.12
+  green_fg_min_saturation: 0.15
+  green_bg_alpha_suppress: 0.5
+  green_bg_margin: 0.08
+  green_bg_alpha_thresh: 0.02
+  green_bg_min_saturation: 0.10
+  uncertainty: 0.1
+  coarse_alpha_l1: 0.5
+  coarse_fg_l1: 0.3
+  native_alpha_delta_reg: 0.10
+  native_fg_delta_reg: 0.10
+  quality_eval: 0.1
+
+ddp:
+  backend: nccl
+  find_unused_parameters: false
+  timeout_minutes: 30

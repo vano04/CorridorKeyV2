@@ -1,0 +1,4 @@
+from .v3_hybrid_matting import V3HybridVideoMattingModel, build_v3_hybrid_video_matting_model, V3InferenceOptions
+from .v3_hybrid_matting import build_v3_hybrid_video_matting_model as build_memory_guided_video_matting_model
+
+__all__ = ["V3HybridVideoMattingModel", "build_v3_hybrid_video_matting_model", "build_memory_guided_video_matting_model", "V3InferenceOptions"]
