@@ -283,34 +283,13 @@ def _import_dataset_runtime(module_name: str) -> DatasetRuntime:
 
 
 def resolve_dataset_runtime(data_cfg: Dict[str, Any]) -> DatasetRuntime:
-    preferred_module = str(data_cfg.get("dataset_module", "")).strip()
-    candidates = [
-        preferred_module,
-        "CorridorKeyDataset.dataset",
-        "CorridorKeyWebDataset.dataset",
-        "dataset",
-    ]
-
-    seen = set()
-    unique_candidates: List[str] = []
-    for candidate in candidates:
-        if not candidate or candidate in seen:
-            continue
-        seen.add(candidate)
-        unique_candidates.append(candidate)
-
-    errors: List[str] = []
-    for module_name in unique_candidates:
-        try:
-            return _import_dataset_runtime(module_name)
-        except Exception as exc:
-            errors.append(f"{module_name}: {exc}")
-
-    raise ImportError(
-        "Unable to resolve dataset module. Tried: "
-        + ", ".join(unique_candidates)
-        + ". Errors: "
-        + " | ".join(errors)
+    import dataset_web
+    return DatasetRuntime(
+        module_name="dataset_web",
+        web_sequence_dataset_cls=dataset_web.CorridorKeyWebSequenceDataset,
+        sequence_dataset_cls=dataset_web.CorridorKeySequenceDataset,
+        create_ddp_dataloader=dataset_web.create_ddp_dataloader,
+        set_dataloader_epoch=dataset_web.set_dataloader_epoch,
     )
 
 
@@ -1230,27 +1209,11 @@ def build_dataloader(config: Dict[str, Any], rank: int, world_size: int) -> Data
 
     sequence_length = int(max(data_cfg.get("clip_len_max", 12), data_cfg.get("dataset_sequence_length", 12)))
 
-    dataset_root = Path(data_cfg["root_dir"])
+    dataset_root = Path(data_cfg.get("root_dir", "."))
     shard_glob = str(data_cfg.get("shard_glob", "*.tar"))
-    webdataset_root = resolve_webdataset_root(data_cfg=data_cfg, default_root=dataset_root, shard_glob=shard_glob)
+    
+    use_webdataset = True
 
-    explicit_dataset_type = str(data_cfg.get("dataset_type", "")).strip().lower()
-    root_has_shards = dataset_root.is_dir() and any(dataset_root.glob(shard_glob))
-    web_root_has_shards = (
-        webdataset_root is not None
-        and webdataset_root.is_dir()
-        and any(webdataset_root.glob(shard_glob))
-    )
-
-    use_webdataset = (
-        explicit_dataset_type in {"webdataset", "wds", "tar"}
-        or bool(data_cfg.get("dataset_is_sharded", False))
-        or root_has_shards
-        or web_root_has_shards
-    )
-
-    if use_webdataset and webdataset_root is not None:
-        dataset_root = webdataset_root
 
     dataset_convert_to_float = _resolve_bool_cfg(
         data_cfg.get("dataset_convert_to_float"),
