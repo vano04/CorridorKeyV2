@@ -11,10 +11,8 @@ from pathlib import Path
 # Make the project root importable regardless of the working directory, and
 # also keep the mono-repo root available for shared helpers.
 _project_root = str(Path(__file__).resolve().parent)
-_repo_root = str(Path(__file__).resolve().parent.parent)
-for _path in (_project_root, _repo_root):
-    if _path not in sys.path:
-        sys.path.insert(0, _path)
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
 
 
 import argparse

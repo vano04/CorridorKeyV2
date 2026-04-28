@@ -16,11 +16,9 @@ import torch
 from torch.utils.data import DataLoader
 
 _HERE = Path(__file__).resolve().parent
-_PROJECT_ROOT = _HERE
-_REPO_ROOT = _HERE.parent
-for _path in (str(_PROJECT_ROOT), str(_REPO_ROOT)):
-    if _path not in sys.path:
-        sys.path.insert(0, _path)
+_PROJECT_ROOT = str(_HERE)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 from CorridorKeyDataset.dataset import (  # noqa: E402
     DEFAULT_MODALITIES,
