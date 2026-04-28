@@ -74,15 +74,22 @@ def _resize_video(video: Tensor, out_hw: Tuple[int, int]) -> Tensor:
     return x.reshape(b, t, c, out_hw[0], out_hw[1])
 
 
+@torch.jit.script
 def _boundary_band(alpha: Tensor, kernel_size: int = 3) -> Tensor:
+    """Morphological boundary band via dilation - erosion.
+
+    Uses in-place .neg_() and .clamp_() to avoid extra kernel launches.
+    """
     bt = alpha.shape[0] * alpha.shape[1]
     a = alpha.reshape(bt, 1, alpha.shape[-2], alpha.shape[-1])
-    dil = F.max_pool2d(a, kernel_size, stride=1, padding=kernel_size // 2)
-    ero = -F.max_pool2d(-a, kernel_size, stride=1, padding=kernel_size // 2)
-    band = (dil - ero).clamp(0.0, 1.0)
+    neg_a = a.neg()  # 1 launch
+    dil = F.max_pool2d(a,     kernel_size, stride=1, padding=kernel_size // 2)
+    ero = F.max_pool2d(neg_a, kernel_size, stride=1, padding=kernel_size // 2).neg_()  # in-place negate
+    band = (dil - ero).clamp_(0.0, 1.0)  # in-place clamp
     return band.reshape(alpha.shape[0], alpha.shape[1], 1, alpha.shape[-2], alpha.shape[-1])
 
 
+@torch.jit.script
 def _green_excess_map(rgb: Tensor) -> Tensor:
     """Compute green excess: G - max(R, B), clamped to [0, 1]."""
     g = rgb[:, :, 1:2]
@@ -91,16 +98,28 @@ def _green_excess_map(rgb: Tensor) -> Tensor:
     return (g - torch.maximum(r, b)).clamp(0.0, 1.0)
 
 
-def _chroma_distance_map(rgb: Tensor, key_color: Tuple[float, float, float] = (0.0, 1.0, 0.0)) -> Tensor:
-    """Compute per-pixel chroma distance to key color."""
-    luma = 0.299 * rgb[:, :, 0:1] + 0.587 * rgb[:, :, 1:2] + 0.114 * rgb[:, :, 2:3]
-    chroma = rgb - luma
-    key = torch.tensor(key_color, device=rgb.device, dtype=rgb.dtype).view(1, 1, 3, 1, 1)
-    key_luma = 0.299 * key_color[0] + 0.587 * key_color[1] + 0.114 * key_color[2]
-    key_chroma = key - key_luma
-    diff = chroma - key_chroma
-    dist = (diff ** 2).sum(dim=2, keepdim=True).sqrt()
-    return dist.clamp(0.0, 1.0)
+@torch.jit.script
+def _chroma_distance_map(
+    rgb: Tensor,
+    key_r: float = 0.0,
+    key_g: float = 1.0,
+    key_b: float = 0.0,
+) -> Tensor:
+    """Per-pixel chroma distance to key color.
+
+    TorchScript fuses the luma, chroma-diff, and L2 chains into ~3 kernels.
+    Key color passed as scalars (not a tuple) for TorchScript compatibility.
+    """
+    r = rgb[:, :, 0:1]
+    g = rgb[:, :, 1:2]
+    b = rgb[:, :, 2:3]
+    luma = 0.299 * r + 0.587 * g + 0.114 * b
+    key_luma = 0.299 * key_r + 0.587 * key_g + 0.114 * key_b
+    # Fused: chroma diff from key in one expression per channel
+    dr = (r - luma) - (key_r - key_luma)
+    dg = (g - luma) - (key_g - key_luma)
+    db = (b - luma) - (key_b - key_luma)
+    return (dr * dr + dg * dg + db * db).sqrt().clamp(0.0, 1.0)
 
 
 def _unknown_band_from_hint(hint: Tensor, threshold: float = 0.02) -> Tensor:
@@ -274,7 +293,22 @@ class V3HybridVideoMattingModel(nn.Module):
         else:
             self.native_refiner = None
 
-    def _build_local_input(self, video, coarse_alpha_init, tile_coords, source_hw):
+    def _build_local_input(
+        self,
+        video: Tensor,
+        coarse_alpha_init: Tensor,
+        tile_coords: Optional[Tensor],
+        source_hw: Optional[Tensor],
+        guidance_present: Optional[Tensor] = None,
+        green_excess: Optional[Tensor] = None,
+        chroma_dist: Optional[Tensor] = None,
+    ) -> Tensor:
+        """Build the local tile encoder input tensor.
+
+        green_excess / chroma_dist can be passed in pre-computed to avoid
+        redundant _green_excess_map / _chroma_distance_map calls when the same
+        video tensor is used for both global and local inputs.
+        """
         b, t, _, h, w = video.shape
         device = video.device
         dtype = video.dtype
@@ -282,10 +316,20 @@ class V3HybridVideoMattingModel(nn.Module):
         cond[:, 0] = coarse_alpha_init
         parts = [video, cond]
         if self.guidance_presence_flag:
-            flag = torch.zeros(b, t, 1, h, w, device=device, dtype=dtype); flag[:, 0] = 1.0; parts.append(flag)
+            if guidance_present is None:
+                guidance_present = torch.ones(b, 1, 1, 1, device=device, dtype=dtype)
+            else:
+                guidance_present = guidance_present.to(device=device, dtype=dtype)
+            flag = torch.zeros(b, t, 1, h, w, device=device, dtype=dtype)
+            flag[:, 0] = guidance_present
+            parts.append(flag)
         if self.use_green_priors:
-            ge = _green_excess_map(video)
-            cd = _chroma_distance_map(video)
+            if green_excess is None:
+                green_excess = _green_excess_map(video)
+            if chroma_dist is None:
+                chroma_dist = _chroma_distance_map(video)
+            ge = green_excess
+            cd = chroma_dist
             if self.training and self.green_prior_dropout > 0.0:
                 keep = (
                     torch.rand((b, 1, 1, 1, 1), device=device)
@@ -307,7 +351,19 @@ class V3HybridVideoMattingModel(nn.Module):
             parts.append(coord_maps.unsqueeze(1).expand(b, t, -1, h, w))
         return torch.cat(parts, dim=2)
 
-    def _build_global_input(self, global_video, global_coarse_alpha_init, global_fg_guidance: Optional[Tensor] = None):
+    def _build_global_input(
+        self,
+        global_video: Tensor,
+        global_coarse_alpha_init: Tensor,
+        global_fg_guidance: Optional[Tensor] = None,
+        green_excess: Optional[Tensor] = None,
+        chroma_dist: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
+        """Build global context branch input tensors.
+
+        green_excess / chroma_dist can be pre-computed and passed in to avoid
+        a second call when global_video == video.
+        """
         b, t, _, h, w = global_video.shape
         cond = torch.zeros(b, t, 1, h, w, device=global_video.device, dtype=global_video.dtype)
         cond[:, 0] = global_coarse_alpha_init
@@ -317,18 +373,18 @@ class V3HybridVideoMattingModel(nn.Module):
                 fg_guidance = global_fg_guidance.to(device=global_video.device, dtype=global_video.dtype)
             else:
                 fg_guidance = torch.zeros(
-                    b,
-                    t,
-                    3,
-                    h,
-                    w,
+                    b, t, 3, h, w,
                     device=global_video.device,
                     dtype=global_video.dtype,
                 )
         green_priors = None
         if self.use_green_priors:
-            ge = _green_excess_map(global_video)
-            cd = _chroma_distance_map(global_video)
+            if green_excess is None:
+                green_excess = _green_excess_map(global_video)
+            if chroma_dist is None:
+                chroma_dist = _chroma_distance_map(global_video)
+            ge = green_excess
+            cd = chroma_dist
             if self.training and self.green_prior_dropout > 0.0:
                 keep = (
                     torch.rand((b, 1, 1, 1, 1), device=global_video.device)
@@ -364,23 +420,23 @@ class V3HybridVideoMattingModel(nn.Module):
         with fp8_context:
             coarse_alpha_model = coarse_alpha_init
             global_coarse_alpha_model = global_coarse_alpha_init
+            guidance_present = torch.ones(b, 1, 1, 1, device=video.device, dtype=video.dtype)
             if self.training and self.coarse_alpha_drop_prob > 0.0:
                 drop = (
                     torch.rand((b, 1, 1, 1), device=video.device)
                     < self.coarse_alpha_drop_prob
                 )
+                guidance_present = (~drop).to(dtype=video.dtype)
                 coarse_alpha_model = torch.where(drop, torch.zeros_like(coarse_alpha_init), coarse_alpha_init)
                 if global_coarse_alpha_model is not None:
-                    global_drop = (
-                        torch.rand((b, 1, 1, 1), device=video.device)
-                        < self.coarse_alpha_drop_prob
-                    )
                     global_coarse_alpha_model = torch.where(
-                        global_drop,
+                        drop,
                         torch.zeros_like(global_coarse_alpha_model),
                         global_coarse_alpha_model,
                     )
 
+            shared_ge: Optional[Tensor] = None
+            shared_cd: Optional[Tensor] = None
             if global_tokens is None:
                 if global_video is not None and global_coarse_alpha_model is not None:
                     c_bc, gp, fg_guidance = self._build_global_input(
@@ -395,7 +451,20 @@ class V3HybridVideoMattingModel(nn.Module):
                         fg_guidance_global=fg_guidance,
                     )
                 else:
-                    c_bc, gp, fg_guidance = self._build_global_input(video, coarse_alpha_model)
+                    # global_video is None: both branches share the same tensor.
+                    # Compute green priors once and pass to both builders.
+                    if self.use_green_priors:
+                        shared_ge = _green_excess_map(video)
+                        shared_cd = _chroma_distance_map(video)
+                    else:
+                        shared_ge = None
+                        shared_cd = None
+                    c_bc, gp, fg_guidance = self._build_global_input(
+                        video,
+                        coarse_alpha_model,
+                        green_excess=shared_ge,
+                        chroma_dist=shared_cd,
+                    )
                     global_tokens, _ = self.global_context(
                         video_rgb_global=video,
                         coarse_alpha_global=c_bc,
@@ -403,20 +472,29 @@ class V3HybridVideoMattingModel(nn.Module):
                         fg_guidance_global=fg_guidance,
                     )
 
-            local_input = self._build_local_input(video, coarse_alpha_model, tile_coords, source_hw)
+            local_input = self._build_local_input(
+                video,
+                coarse_alpha_model,
+                tile_coords,
+                source_hw,
+                guidance_present=guidance_present,
+                # Re-use pre-computed priors only in the shared-video path
+                green_excess=shared_ge if global_video is None and self.use_green_priors else None,
+                chroma_dist=shared_cd if global_video is None and self.use_green_priors else None,
+            )
             local_input, pad_hw = _pad_video(local_input, self.patch_size)
             video_padded, _ = _pad_video(video, self.patch_size)
             coarse_padded = coarse_alpha_model
             if pad_hw[0] or pad_hw[1]:
                 coarse_padded = _safe_reflect_pad(coarse_alpha_model, pad_hw[1], pad_hw[0])
 
-            decoded, stage_feats = self.local_encoder(x=local_input, coarse_alpha_init=coarse_padded, video_rgb=video_padded, valid_mask=valid_mask, global_tokens=global_tokens)
-
             if self.reference_memory is not None:
+                stage_feats = self.local_encoder.encode(x=local_input, coarse_alpha_init=coarse_padded, video_rgb=video_padded, valid_mask=valid_mask, global_tokens=global_tokens)
                 deepest, ref_tokens_out = self.reference_memory(stage_feats[-1], ref_tokens)
                 stage_feats[-1] = deepest
                 decoded = self.local_encoder.decoder(stage_feats)
             else:
+                decoded, stage_feats = self.local_encoder(x=local_input, coarse_alpha_init=coarse_padded, video_rgb=video_padded, valid_mask=valid_mask, global_tokens=global_tokens)
                 ref_tokens_out = ref_tokens
 
             alpha_pred = self.alpha_head(decoded)

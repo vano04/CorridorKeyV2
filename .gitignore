@@ -1,0 +1,32 @@
+# Archive files
+*.tar
+
+# Checkpoints and model weights
+*.pt*
+
+# Backups
+*.bak*
+
+# Patches
+*.patch
+
+# Python cache
+__pycache__/
+**/__pycache__/
+
+# Lock files
+*.lock
+
+# openexr patched
+openexr/
+
+# Virtualenv
+.venv/
+
+# Runs and outputs
+runs/
+
+# Image / video / EXR outputs
+*.exr
+*.png
+*.mp4

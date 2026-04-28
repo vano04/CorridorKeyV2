@@ -6,7 +6,10 @@ DDP, checkpointing, scheduling, and data loading unchanged.
 """
 from __future__ import annotations
 
-import transformer_engine.pytorch as te  # Fix library loading order for cublasLt
+try:
+    import transformer_engine.pytorch as te  # noqa: F401  # Fix library loading order for cublasLt when available
+except Exception:
+    te = None  # type: ignore[assignment]
 import sys
 from pathlib import Path
 

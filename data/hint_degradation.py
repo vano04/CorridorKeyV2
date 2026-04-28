@@ -95,7 +95,7 @@ def degrade_hint(
     if severity == "clean":
         return coarse_alpha_init
 
-    alpha = coarse_alpha_init
+    alpha = coarse_alpha_init.clone()
 
     if severity == "mild":
         # Mild: small morph + blur + noise

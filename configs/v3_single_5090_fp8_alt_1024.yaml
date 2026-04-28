@@ -81,6 +81,7 @@ data:
   green_foreground_strength_max: 0.35
   green_foreground_alpha_thresh: 0.985
   coarse_alpha_drop_prob: 0.05
+  grayscale_augment_p: 0.20
 
   decode_full_frame: false
   emit_global_context: true

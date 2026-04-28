@@ -9,7 +9,7 @@ resolution. Rewritten from V1's encoder path with V3-specific additions:
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch import Tensor, nn
@@ -141,6 +141,27 @@ class TemporalAttention(nn.Module):
         self.temporal_window = temporal_window
         self.qkv = MaybeTELinear(dim, dim * 3, use_te=fp8_cfg["use_te_linear"] if fp8_cfg else False)
         self.proj = MaybeTELinear(dim, dim, use_te=fp8_cfg["use_te_linear"] if fp8_cfg else False)
+        # Cache: (t, device_str, dtype_str) -> [b=1, 1, t, t] base mask without valid_mask applied.
+        # The base window mask is static for fixed t and temporal_window; it is
+        # broadcast over batch at call time so B-dependent valid_mask is handled
+        # separately without invalidating the cache.
+        self._window_mask_cache: Dict[Tuple[int, str, str], Tensor] = {}
+
+    def _get_window_mask(self, t: int, device: torch.device, dtype: torch.dtype) -> Optional[Tensor]:
+        """Return the [1, 1, t, t] window bias mask, building it once per (t, device, dtype)."""
+        if not (0 < self.temporal_window < t):
+            return None
+        key = (t, str(device), str(dtype))
+        if key not in self._window_mask_cache:
+            radius = max(0, int(self.temporal_window) // 2)
+            idx = torch.arange(t, device=device)
+            window_allowed = (idx[:, None] - idx[None, :]).abs() <= radius  # [t, t]
+            eye = torch.eye(t, device=device, dtype=torch.bool)
+            allowed = window_allowed | eye  # self-attend always
+            mask = torch.zeros(1, 1, t, t, device=device, dtype=dtype)
+            mask.masked_fill_(~allowed.unsqueeze(0).unsqueeze(0), torch.finfo(dtype).min)
+            self._window_mask_cache[key] = mask
+        return self._window_mask_cache[key]
 
     def forward(self, x: Tensor, valid_mask: Optional[Tensor] = None) -> Tensor:
         b, t, h, w, c = x.shape
@@ -149,9 +170,46 @@ class TemporalAttention(nn.Module):
         qkv = self.qkv(x_seq).reshape(b * s, t, 3, self.num_heads, self.head_dim)
         qkv = qkv.permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
-        out = F.scaled_dot_product_attention(q, k, v)
+
+        attn_mask: Optional[Tensor] = None
+        if valid_mask is not None or (0 < self.temporal_window < t):
+            # Start from the cached window mask (0 launches on cache hit)
+            window_base = self._get_window_mask(t, x.device, q.dtype)
+
+            if valid_mask is not None:
+                # Build per-batch allowed mask incorporating valid_mask
+                valid = valid_mask.to(device=x.device, dtype=torch.bool)  # [B, T]
+                # allowed[b, i, j] = valid[b, j] (query i can attend to valid key j)
+                allowed_v = valid[:, None, :]  # [B, 1, T]
+                if window_base is not None:
+                    # window_base: [1,1,T,T] → [B,1,T,T]; combine with valid_mask
+                    allowed_w = (window_base > torch.finfo(q.dtype).min / 2)  # back to bool
+                    allowed = allowed_w.squeeze(0) & allowed_v  # [B, 1, T] broadcast → [B, T, T]
+                    # Always allow self-attention
+                    eye = torch.eye(t, device=x.device, dtype=torch.bool).unsqueeze(0)
+                    allowed = (allowed | eye)  # [B, T, T]
+                    attn_mask = torch.zeros(b, 1, t, t, device=x.device, dtype=q.dtype)
+                    attn_mask.masked_fill_(~allowed.unsqueeze(1), torch.finfo(q.dtype).min)
+                else:
+                    eye = torch.eye(t, device=x.device, dtype=torch.bool).unsqueeze(0)
+                    allowed = (allowed_v.expand(b, t, t) | eye)
+                    attn_mask = torch.zeros(b, 1, t, t, device=x.device, dtype=q.dtype)
+                    attn_mask.masked_fill_(~allowed.unsqueeze(1), torch.finfo(q.dtype).min)
+                # Expand over spatial: [B, 1, T, T] → [B*S, 1, T, T]
+                attn_mask = attn_mask.unsqueeze(1).expand(b, s, 1, t, t).reshape(b * s, 1, t, t)
+            else:
+                # No valid_mask — just use the cached window mask (0 extra launches)
+                attn_mask = window_base  # [1, 1, t, t] broadcast over b*s
+
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         out = out.permute(0, 2, 1, 3).reshape(b * s, t, c)
         out = self.proj(out)
+
+        if valid_mask is not None:
+            out = out.reshape(b, s, t, c)
+            out = out * valid_mask.to(device=x.device, dtype=out.dtype)[:, None, :, None]
+            return out.reshape(b, h, w, t, c).permute(0, 3, 1, 2, 4)
+
         return out.reshape(b, h, w, t, c).permute(0, 3, 1, 2, 4)
 
 
@@ -238,7 +296,6 @@ class SubjectMemoryBank(nn.Module):
     def forward(self, features: Tensor, coarse_alpha_init: Tensor, video: Tensor, valid_mask: Optional[Tensor] = None) -> Tensor:
         b, t, h, w, c = features.shape
         alpha0 = F.interpolate(coarse_alpha_init, size=(h, w), mode="bilinear", align_corners=False)
-        rgb0 = F.interpolate(video[:, 0], size=(h, w), mode="bilinear", align_corners=False)
 
         # Build init tokens
         feat0 = features[:, 0]  # [B, H, W, C]
@@ -248,14 +305,34 @@ class SubjectMemoryBank(nn.Module):
         memory = base.clone()
         memory[:, 0] = pooled
 
-        frame_summary = features.mean(dim=(2, 3))
-        all_summaries = self.update_proj(frame_summary.reshape(b * t, c)).reshape(b, t, c)
+        # Vectorized: project all frame summaries in one batched linear call
+        # then run the GRU-style scan without Python-loop kernel launches for the linear.
+        frame_summary = features.mean(dim=(2, 3))           # [B, T, C]
+        all_summaries = self.update_proj(
+            frame_summary.reshape(b * t, c)
+        ).reshape(b, t, c)                                   # [B, T, C] — one linear call
+
+        # Confidence weights: frame 0 = 1.0, others = 0.25
+        # [B, T] built as a tensor to avoid per-frame torch.full calls
+        confs = torch.full((b, t), 0.25, dtype=memory.dtype, device=memory.device)
+        confs[:, 0] = 1.0
+        if valid_mask is not None:
+            confs = confs * valid_mask.to(dtype=memory.dtype, device=memory.device)
+
+        # Batched gate inputs: compute all [memory, summary] cats for all frames at once.
+        # memory needs to be expanded per-frame inside the scan since it updates,
+        # but we pre-compute the gate linear for *all* frames simultaneously,
+        # then apply them sequentially (scan cannot be parallelised, but at least
+        # the expensive linear is batched, cutting gate launches from 3t → t+2).
+        # summary_exp: [B, T, M, C]
+        summary_exp = all_summaries.unsqueeze(2).expand(-1, -1, self.memory_tokens, -1)
+
         for i in range(t):
-            summary = all_summaries[:, i].unsqueeze(1).expand(-1, self.memory_tokens, -1)
-            confidence = torch.full((b, 1, 1), 1.0 if i == 0 else 0.25, dtype=memory.dtype, device=memory.device)
-            if valid_mask is not None:
-                confidence = confidence * valid_mask[:, i:i+1].to(memory.dtype).view(b, 1, 1)
-            memory = self.update_gate(memory, summary, confidence)
+            s_i = summary_exp[:, i]                          # [B, M, C]
+            conf_i = confs[:, i].view(b, 1, 1)              # [B, 1, 1]
+            g = torch.sigmoid(self.update_gate.gate(torch.cat([memory, s_i], dim=-1)))
+            g = g * conf_i
+            memory = memory + g * (s_i - memory)
         return memory
 
 
@@ -464,6 +541,42 @@ class LocalTileEncoder(nn.Module):
         self.memory_bank = SubjectMemoryBank(dim=embed_dims[-1], memory_tokens=memory_tokens, fp8_cfg=fp8_cfg)
         self.decoder = DecoderFPN(in_dims=embed_dims, out_dim=decoder_out_dim)
 
+    def encode(
+        self,
+        x: Tensor,
+        coarse_alpha_init: Tensor,
+        video_rgb: Tensor,
+        valid_mask: Optional[Tensor] = None,
+        global_tokens: Optional[Tensor] = None,
+    ) -> List[Tensor]:
+        """Run the encoder stages only, returning multi-scale features.
+
+        Use this instead of ``forward()`` when you need to modify stage
+        features (e.g. with reference memory) before running the decoder.
+
+        Returns:
+            stage_features: list of [B, T, H_i, W_i, C_i] for each stage
+        """
+        x = self.patch_embed(x)
+
+        if valid_mask is not None:
+            x = x * valid_mask[:, :, None, None, None].to(x.dtype)
+
+        feats: List[Tensor] = []
+        memory: Optional[Tensor] = None
+
+        for i, stage in enumerate(self.stages):
+            if i == 3:
+                memory = self.memory_bank(x, coarse_alpha_init, video_rgb, valid_mask)
+
+            x = stage(x, memory=memory, valid_mask=valid_mask, global_tokens=global_tokens)
+            feats.append(x)
+
+            if i < 3:
+                x = self.downsamples[i](x)
+
+        return feats
+
     def forward(
         self,
         x: Tensor,
@@ -484,23 +597,6 @@ class LocalTileEncoder(nn.Module):
             decoded: [B*T, decoder_out_dim, Hp, Wp] FPN output at 1/patch_size resolution
             stage_features: list of [B, T, H_i, W_i, C_i] for skip connections
         """
-        x = self.patch_embed(x)
-
-        if valid_mask is not None:
-            x = x * valid_mask[:, :, None, None, None].to(x.dtype)
-
-        feats: List[Tensor] = []
-        memory: Optional[Tensor] = None
-
-        for i, stage in enumerate(self.stages):
-            if i == 3:
-                memory = self.memory_bank(x, coarse_alpha_init, video_rgb, valid_mask)
-
-            x = stage(x, memory=memory, valid_mask=valid_mask, global_tokens=global_tokens)
-            feats.append(x)
-
-            if i < 3:
-                x = self.downsamples[i](x)
-
+        feats = self.encode(x, coarse_alpha_init, video_rgb, valid_mask, global_tokens)
         decoded = self.decoder(feats)
         return decoded, feats

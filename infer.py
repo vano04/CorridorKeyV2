@@ -48,6 +48,7 @@ from Infer.inference import (
     _autocast_context,
     _axis_starts,
     _checkpoint_state_dict,
+    _crop_alpha_tile,
     _default_alpha_dir,
     _default_input_dir,
     _global_context_hw,
@@ -127,24 +128,37 @@ def _run_v3_global_context(
     seed_dev = seed_global.unsqueeze(0).to(device=device, dtype=torch.float32)
 
     with _autocast_context(device, amp, amp_dtype):
-        coarse_bc = torch.zeros(
-            1, temporal_frames, 1, global_hw[0], global_hw[1],
-            device=device, dtype=video_dev.dtype,
-        )
-        coarse_bc[:, 0] = seed_dev
+        if hasattr(model, "_build_global_input"):
+            coarse_bc, green_priors, fg_guidance = model._build_global_input(
+                video_dev,
+                seed_dev,
+                global_fg_guidance=None,
+            )
+            global_tokens, _ = model.global_context(
+                video_rgb_global=video_dev,
+                coarse_alpha_global=coarse_bc,
+                green_priors_global=green_priors,
+                fg_guidance_global=fg_guidance,
+            )
+        else:
+            coarse_bc = torch.zeros(
+                1, temporal_frames, 1, global_hw[0], global_hw[1],
+                device=device, dtype=video_dev.dtype,
+            )
+            coarse_bc[:, 0] = seed_dev
 
-        green_priors = None
-        if hasattr(model, "use_green_priors") and model.use_green_priors:
-            from models.v3_hybrid_matting import _green_excess_map, _chroma_distance_map
-            ge = _green_excess_map(video_dev)
-            cd = _chroma_distance_map(video_dev)
-            green_priors = torch.cat([ge, cd], dim=2)
+            green_priors = None
+            if hasattr(model, "use_green_priors") and model.use_green_priors:
+                from models.v3_hybrid_matting import _green_excess_map, _chroma_distance_map
+                ge = _green_excess_map(video_dev)
+                cd = _chroma_distance_map(video_dev)
+                green_priors = torch.cat([ge, cd], dim=2)
 
-        global_tokens, _ = model.global_context(
-            video_rgb_global=video_dev,
-            coarse_alpha_global=coarse_bc,
-            green_priors_global=green_priors,
-        )
+            global_tokens, _ = model.global_context(
+                video_rgb_global=video_dev,
+                coarse_alpha_global=coarse_bc,
+                green_priors_global=green_priors,
+            )
 
     return global_tokens
 
@@ -224,13 +238,11 @@ def run_v3_tiled_inference(
             video_tile, _, valid_mask_cpu = sequence.read_window_tile(
                 start=start, window=temporal_frames, tile=tile,
             )
-            seed_tile = initial_alpha_cpu[:1, :tile.y1 - tile.y0, :tile.x1 - tile.x0]
-            if seed_tile.shape[-2:] != (tile.y1 - tile.y0, tile.x1 - tile.x0):
-                from Infer.inference import _crop_alpha_tile
-                seed_tile = _crop_alpha_tile(carry_seed, tile)
+            seed_tile = _crop_alpha_tile(carry_seed, tile)
 
             video_dev = video_tile.unsqueeze(0).to(device=device, dtype=torch.float32)
             seed_dev = seed_tile.unsqueeze(0).to(device=device, dtype=torch.float32)
+            valid_mask_dev = valid_mask_cpu.unsqueeze(0).to(device=device, dtype=torch.float32)
 
             tile_coords = torch.tensor(
                 [[float(tile.y0), float(tile.y1), float(tile.x0), float(tile.x1)]],
@@ -245,6 +257,7 @@ def run_v3_tiled_inference(
                 out = model(
                     video=video_dev,
                     coarse_alpha_init=seed_dev,
+                    valid_mask=valid_mask_dev,
                     global_tokens=global_tokens,
                     tile_coords=tile_coords,
                     source_hw=source_hw,
@@ -258,7 +271,7 @@ def run_v3_tiled_inference(
             fg_acc[:, :, tile.y0:tile.y1, tile.x0:tile.x1] += fg_tile * weight
             weight_acc[:, :, tile.y0:tile.y1, tile.x0:tile.x1] += weight
 
-            del video_dev, seed_dev, out
+            del video_dev, seed_dev, valid_mask_dev, out
 
         dt_tiles = time.perf_counter() - t0_tiles
 

@@ -4,6 +4,10 @@ Verifies: synthetic batch → forward → loss → backward → no NaN/Inf.
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 import pytest
 import torch
 
@@ -122,7 +126,7 @@ def test_all_loss_components_present(model_and_device):
         "total", "alpha_l1", "alpha_lap", "fg_l1", "comp_l1",
         "alpha_band_l1", "alpha_band_lap", "temporal_alpha", "temporal_fg",
         "comp_random_bg", "coarse_alpha_l1", "coarse_fg_l1",
-        "native_alpha_delta_reg", "native_fg_delta_reg", "quality_eval",
+        "native_alpha_delta_reg", "native_fg_delta_reg", "uncertainty", "quality_eval",
         "green_bg_alpha_suppress", "green_bg_alpha_suppress_abs", "green_bg_pixels",
     }
     for k in expected_keys:
@@ -174,8 +178,8 @@ def test_green_background_alpha_suppression_targets_zero_alpha(model_and_device)
 
     assert green_bg_items["green_bg_pixels"] > nongreen_items["green_bg_pixels"]
     assert green_bg_items["green_bg_alpha_suppress"] > nongreen_items["green_bg_alpha_suppress"]
-    assert torch.isclose(nongreen_loss, torch.zeros_like(nongreen_loss))
-    assert green_bg_loss > 0
+    assert torch.isclose(nongreen_items["green_bg_alpha_suppress"], torch.zeros_like(nongreen_items["green_bg_alpha_suppress"]))
+    assert green_bg_items["green_bg_alpha_suppress"] > 0
 
 
 def test_laplacian_loss_handles_small_spatial_sizes():
@@ -188,6 +192,31 @@ def test_laplacian_loss_handles_small_spatial_sizes():
     y_1 = torch.rand(1, 1, 1, 1)
     l_1 = _laplacian_pyramid_loss(x_1, y_1, levels=5)
     assert torch.isfinite(l_1)
+
+
+
+
+def test_laplacian_loss_does_not_amplify_constant_offsets():
+    x = torch.zeros(2, 1, 64, 64)
+    y = torch.ones(2, 1, 64, 64)
+
+    loss = _laplacian_pyramid_loss(x, y, levels=5)
+
+    assert torch.isfinite(loss)
+    assert loss <= 1.0
+
+
+def test_laplacian_loss_preserves_thin_soft_mask_support():
+    x = torch.zeros(1, 1, 64, 64)
+    y = torch.zeros_like(x)
+    y[:, :, 31:33, :] = 1.0
+    mask = torch.zeros_like(x)
+    mask[:, :, 31:33, :] = 1.0
+
+    loss = _laplacian_pyramid_loss(x, y, levels=5, mask=mask)
+
+    assert torch.isfinite(loss)
+    assert loss > 0
 
 
 def test_alpha_lap_valid_mask_is_normalized_over_valid_support():
@@ -247,3 +276,90 @@ def test_alpha_lap_valid_mask_is_normalized_over_valid_support():
     assert torch.isfinite(items_all["alpha_lap"])
     assert torch.isfinite(items_half["alpha_lap"])
     assert torch.isclose(items_all["alpha_lap"], items_half["alpha_lap"], rtol=1e-5, atol=1e-6)
+
+
+def test_masked_losses_are_normalized_over_valid_frames():
+    criterion = V3MattingLossComputer(
+        weights={
+            "alpha_l1": 1.0,
+            "alpha_laplacian": 0.0,
+            "fg_l1": 1.0,
+            "comp_l1": 1.0,
+            "alpha_band_l1": 0.0,
+            "alpha_band_laplacian": 0.0,
+            "temporal_alpha_gradient": 0.0,
+            "temporal_fg_gradient": 0.0,
+            "comp_random_bg": 0.0,
+            "spill_l1": 0.0,
+            "green_fg_alpha": 0.0,
+            "green_fg_color": 0.0,
+            "green_bg_alpha_suppress": 0.0,
+            "coarse_alpha_l1": 0.0,
+            "coarse_fg_l1": 0.0,
+            "native_alpha_delta_reg": 0.0,
+            "native_fg_delta_reg": 0.0,
+            "uncertainty": 0.0,
+            "quality_eval": 0.0,
+        },
+        fg_representation="premul",
+    )
+
+    b, t, h, w = 1, 4, 8, 8
+    alpha_pred = torch.ones(b, t, 1, h, w)
+    alpha_gt = torch.zeros(b, t, 1, h, w)
+    fg_pred = torch.ones(b, t, 3, h, w)
+    fg_gt = torch.zeros(b, t, 3, h, w)
+    comp_pred = torch.ones(b, t, 3, h, w)
+    comp_gt = torch.zeros(b, t, 3, h, w)
+    pred = {"alpha_pred": alpha_pred, "fg_pred": fg_pred, "comp_pred": comp_pred}
+    base_batch = {"alpha_gt": alpha_gt, "fg_gt": fg_gt, "video_rgb": comp_gt, "input_gt": comp_gt}
+
+    _, items_all = criterion(pred, {**base_batch, "valid_mask": torch.tensor([[1.0, 1.0, 1.0, 1.0]])})
+    _, items_half = criterion(pred, {**base_batch, "valid_mask": torch.tensor([[1.0, 1.0, 0.0, 0.0]])})
+
+    for key in ("alpha_l1", "fg_l1", "comp_l1"):
+        assert torch.isclose(items_all[key], items_half[key], rtol=1e-5, atol=1e-6)
+
+
+def test_uncertainty_weight_contributes_to_total_when_prediction_exists():
+    criterion = V3MattingLossComputer(
+        weights={
+            "alpha_l1": 0.0,
+            "alpha_laplacian": 0.0,
+            "fg_l1": 0.0,
+            "comp_l1": 0.0,
+            "alpha_band_l1": 0.0,
+            "alpha_band_laplacian": 0.0,
+            "temporal_alpha_gradient": 0.0,
+            "temporal_fg_gradient": 0.0,
+            "comp_random_bg": 0.0,
+            "spill_l1": 0.0,
+            "green_fg_alpha": 0.0,
+            "green_fg_color": 0.0,
+            "green_bg_alpha_suppress": 0.0,
+            "coarse_alpha_l1": 0.0,
+            "coarse_fg_l1": 0.0,
+            "native_alpha_delta_reg": 0.0,
+            "native_fg_delta_reg": 0.0,
+            "uncertainty": 1.0,
+            "quality_eval": 0.0,
+        },
+        fg_representation="premul",
+    )
+
+    b, t, h, w = 1, 2, 4, 4
+    alpha_pred = torch.ones(b, t, 1, h, w)
+    alpha_gt = torch.zeros(b, t, 1, h, w)
+    fg = torch.zeros(b, t, 3, h, w)
+    pred = {
+        "alpha_pred": alpha_pred,
+        "fg_pred": fg,
+        "comp_pred": fg,
+        "uncertainty_pred": torch.zeros(b, t, 1, h, w),
+    }
+    batch = {"alpha_gt": alpha_gt, "fg_gt": fg, "video_rgb": fg, "input_gt": fg}
+
+    total, items = criterion(pred, batch)
+
+    assert items["uncertainty"] > 0
+    assert torch.isclose(total, items["uncertainty"])
