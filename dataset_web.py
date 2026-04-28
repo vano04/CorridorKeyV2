@@ -682,7 +682,7 @@ def create_dataset_pipeline(
             if split_key == "train" and is_val:
                 continue
                 
-            urls.append(f"pipe:curl -s -L -H '{auth_header}' https://huggingface.co/datasets/Vano04/CorridorKeyDataset_Custom/resolve/main/{f.rfilename}")
+            urls.append(f"pipe:curl -s -L -H '{auth_header}' --retry 10 --retry-connrefused --retry-delay 2 https://huggingface.co/datasets/Vano04/CorridorKeyDataset_Custom/resolve/main/{f.rfilename}")
             
     if not urls:
         raise RuntimeError(f"No URLs found for split {split_key}")
@@ -698,7 +698,7 @@ def create_dataset_pipeline(
         ]
     
     # decode the tar stream
-    pipeline.append(wds.tarfile_to_samples())
+    pipeline.append(wds.tarfile_to_samples(handler=wds.warn_and_continue))
     
     if split_key == "train":
         # Buffer a small number of full clips to mix them up without OOMing.
