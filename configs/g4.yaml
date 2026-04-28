@@ -96,7 +96,7 @@ data:
   decode_global_context: false
   global_context_modalities: [Input, Alpha, FG]
   num_workers: 24                  # Scaled for 48-thread CPU
-  prefetch_factor: 2               # Lowered to prevent OOM on 176GB RAM
+  prefetch_factor: 4               # Bumped up now that shuffle buffers are fixed
   persistent_workers: true
   pin_memory: true
 train:
