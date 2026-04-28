@@ -94,7 +94,7 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from losses import V3MattingLossComputer
-from models import InferenceOptions, build_v3_hybrid_video_matting_model
+from models import V3InferenceOptions, build_v3_hybrid_video_matting_model
 from utils import (
     AsyncDevicePrefetcher,
     CorridorMattingTransform,
@@ -397,7 +397,7 @@ def cuda_warmup(
     batch_size: int = 1,
     input_dtype: torch.dtype = torch.float32,
     resolution_buckets: List[int] | None = None,
-    inference_options: InferenceOptions | None = None,
+    inference_options: V3InferenceOptions | None = None,
     optimizer: torch.optim.Optimizer | None = None,
     scaler: torch.amp.GradScaler | None = None,
     verbose: bool = False,
@@ -433,7 +433,7 @@ def cuda_warmup(
 
         dummy_video = torch.randn(b, t, 3, h, w, device=device, dtype=input_dtype)
         dummy_alpha = torch.rand(b, 1, h, w, device=device, dtype=input_dtype)
-        warmup_opts = inference_options if inference_options is not None else InferenceOptions(mode="full")
+        warmup_opts = inference_options if inference_options is not None else V3InferenceOptions(mode="full")
         forward_kwargs: Dict[str, Any] = {}
         if warmup_opts.mode == "hybrid":
             cap = max(1, int(warmup_opts.global_long_side_cap))
@@ -1685,7 +1685,7 @@ def train() -> None:
     # Training can run the full, lowres, or tiled inference path; build the
     # options before CUDA warmup so warmup exercises the same active branches.
     inference_cfg = cfg.get("inference", {})
-    train_inference_opts = InferenceOptions(
+    train_inference_opts = V3InferenceOptions(
         mode=train_inference_mode,
         global_long_side_cap=int(train_cfg.get("global_long_side_cap", inference_cfg.get("global_long_side_cap", 2048))),
         tile_size=int(train_cfg.get("tile_size", inference_cfg.get("tile_size", 1024))),
