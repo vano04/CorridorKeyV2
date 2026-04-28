@@ -700,7 +700,9 @@ def create_dataset_pipeline(
     pipeline.append(wds.tarfile_to_samples())
     
     if split_key == "train":
-        pipeline.append(wds.shuffle(100))
+        # Buffer a small number of full clips to mix them up without OOMing.
+        # A single clip can be hundreds of MBs in compressed EXR bytes.
+        pipeline.append(wds.shuffle(5))
         
     def window_generator(src):
         for clip in src:
@@ -726,7 +728,10 @@ def create_dataset_pipeline(
     pipeline.append(window_generator)
     
     if split_key == "train":
-        pipeline.append(wds.shuffle(1000))
+        # Buffer a small number of decoded windows. Decoded windows are HUGE 
+        # (potentially 1GB+ each for 16 frames of 1024x1024 across 4 modalities + global).
+        # We rely on PyTorch DataLoader round-robining across the 24 workers to mix clips.
+        pipeline.append(wds.shuffle(4))
         
     return wds.DataPipeline(*pipeline).with_epoch(10000)
 
