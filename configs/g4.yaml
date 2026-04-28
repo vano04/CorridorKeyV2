@@ -73,7 +73,7 @@ data:
   fg_representation: premul
   device_augment: true
   host_dtype: bf16
-  num_torch_threads: 2             # Adjusted for 12-24 thread CPU
+  num_torch_threads: 4             # Scaled for 48-thread CPU
   horizontal_flip_p: 0.5
   background_replace_p: 0.3
   spill_augment_p: 0.4
@@ -91,11 +91,11 @@ data:
   local_tile_span: 4
   source_hw: [2048, 2048]
   exr_internal_threads: 0
-  exr_decode_threads: 4            # Adjusted for 12-24 thread CPU
+  exr_decode_threads: 8            # Scaled for 48-thread CPU
   emit_tile_metadata: true
   decode_global_context: false
   global_context_modalities: [Input, Alpha, FG]
-  num_workers: 12                  # Adjusted for 12-24 thread CPU
+  num_workers: 24                  # Scaled for 48-thread CPU
   prefetch_factor: 8               # Increased for ~300GB RAM
   persistent_workers: true
   pin_memory: true
