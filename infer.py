@@ -240,7 +240,7 @@ def run_v3_tiled_inference(
 
             video_dev = video_tile.unsqueeze(0).to(device=device, dtype=torch.float32)
             seed_dev = seed_tile.unsqueeze(0).to(device=device, dtype=torch.float32)
-            valid_mask_dev = valid_mask_cpu.unsqueeze(0).to(device=device, dtype=torch.float32)
+            valid_mask_dev = valid_mask_cpu.to(device=device, dtype=torch.float32)
 
             tile_coords = torch.tensor(
                 [[float(tile.y0), float(tile.y1), float(tile.x0), float(tile.x1)]],

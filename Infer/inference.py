@@ -320,10 +320,44 @@ def _read_input_tile(path: Path, info: TiledExrInfo, tile: Tile) -> Tensor:
 
 
 def _read_alpha_tile(path: Path, info: TiledExrInfo, tile: Tile) -> Tensor:
-    tensor, actual = _read_exr_native_tiles(path, info, tile)
-    if tensor.shape[0] < 1:
+    read_x0 = max(0, min(tile.x0, info.width - 1))
+    read_y0 = max(0, min(tile.y0, info.height - 1))
+    read_x1 = max(read_x0 + 1, min(tile.x1, info.width))
+    read_y1 = max(read_y0 + 1, min(tile.y1, info.height))
+
+    tx0 = read_x0 // info.tile_width
+    ty0 = read_y0 // info.tile_height
+    tx1 = (read_x1 - 1) // info.tile_width
+    ty1 = (read_y1 - 1) // info.tile_height
+    tx1 = min(tx1, info.num_x_tiles - 1)
+    ty1 = min(ty1, info.num_y_tiles - 1)
+
+    with OpenEXR.File(str(path), header_only=True) as exr:
+        channels = {
+            name: np.asarray(ch.pixels)
+            for name, ch in exr.readTiles(tx0, tx1, ty0, ty1, separate_channels=True).items()
+        }
+
+    if not channels:
         raise ValueError(f"Alpha frame {path} has no channels")
-    return _pad_tile_tensor(tensor[:1], tile, actual).clamp(0.0, 1.0)
+
+    selected = None
+    for name in ("A", "a", "alpha", "Alpha", "Y", "y", "R", "r"):
+        if name in channels:
+            selected = channels[name]
+            break
+    if selected is None:
+        # Fall back to deterministic order if no standard alpha/luma names exist.
+        selected = channels[sorted(channels)[0]]
+
+    tensor = _array_to_chw_float(np.asarray(selected))
+    x_offset = read_x0 - tx0 * info.tile_width
+    y_offset = read_y0 - ty0 * info.tile_height
+    crop_w = read_x1 - read_x0
+    crop_h = read_y1 - read_y0
+    tensor = tensor[:, y_offset : y_offset + crop_h, x_offset : x_offset + crop_w]
+    actual = Tile(y0=read_y0, y1=read_y1, x0=read_x0, x1=read_x1)
+    return _pad_tile_tensor(tensor[:1].contiguous(), tile, actual).clamp(0.0, 1.0)
 
 
 def _resize_alpha_to(alpha: Tensor, hw: Tuple[int, int]) -> Tensor:
