@@ -687,14 +687,15 @@ def create_dataset_pipeline(
     if not urls:
         raise RuntimeError(f"No URLs found for split {split_key}")
         
-    pipeline = [wds.SimpleShardList(urls)]
-    
-    # Shuffle shards if train
     if split_key == "train":
-        pipeline.append(wds.shuffle(100))
-        
-    pipeline.append(wds.split_by_node)
-    pipeline.append(wds.split_by_worker)
+        # Infinite random sampling of shards prevents DDP deadlock and early epoch truncation
+        pipeline = [wds.ResampledShards(urls)]
+    else:
+        pipeline = [
+            wds.SimpleShardList(urls),
+            wds.split_by_node,
+            wds.split_by_worker
+        ]
     
     # decode the tar stream
     pipeline.append(wds.tarfile_to_samples())
