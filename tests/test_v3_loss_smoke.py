@@ -278,6 +278,52 @@ def test_alpha_lap_valid_mask_is_normalized_over_valid_support():
     assert torch.isclose(items_all["alpha_lap"], items_half["alpha_lap"], rtol=1e-5, atol=1e-6)
 
 
+def test_alpha_lap_sanitizes_invalid_alpha_targets():
+    criterion = V3MattingLossComputer(
+        weights={
+            "alpha_l1": 1.0,
+            "alpha_laplacian": 1.0,
+            "fg_l1": 0.0,
+            "comp_l1": 0.0,
+            "alpha_band_l1": 0.0,
+            "alpha_band_laplacian": 0.0,
+            "temporal_alpha_gradient": 0.0,
+            "temporal_fg_gradient": 0.0,
+            "comp_random_bg": 0.0,
+            "spill_l1": 0.0,
+            "green_fg_alpha": 0.0,
+            "green_fg_color": 0.0,
+            "green_bg_alpha_suppress": 0.0,
+            "coarse_alpha_l1": 0.0,
+            "coarse_fg_l1": 0.0,
+            "native_alpha_delta_reg": 0.0,
+            "native_fg_delta_reg": 0.0,
+            "uncertainty": 0.0,
+            "quality_eval": 0.0,
+        },
+        fg_representation="premul",
+    )
+
+    b, t, h, w = 1, 1, 8, 8
+    alpha_pred = torch.zeros(b, t, 1, h, w)
+    alpha_gt = torch.rand(b, t, 1, h, w)
+    alpha_gt[..., 0, 0] = float("nan")
+    alpha_gt[..., 0, 1] = float("inf")
+    alpha_gt[..., 0, 2] = -0.25
+    alpha_gt[..., 0, 3] = 1.078125
+    fg = torch.zeros(b, t, 3, h, w)
+    comp = torch.zeros(b, t, 3, h, w)
+
+    total, items = criterion(
+        {"alpha_pred": alpha_pred, "fg_pred": fg, "comp_pred": comp},
+        {"alpha_gt": alpha_gt, "fg_gt": fg, "video_rgb": comp, "input_gt": comp},
+    )
+
+    assert torch.isfinite(total)
+    assert torch.isfinite(items["alpha_l1"])
+    assert torch.isfinite(items["alpha_lap"])
+
+
 def test_masked_losses_are_normalized_over_valid_frames():
     criterion = V3MattingLossComputer(
         weights={

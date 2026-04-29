@@ -49,6 +49,10 @@ def _masked_mean(value: Tensor, mask: Optional[Tensor] = None) -> Tensor:
     return _masked_mean_scripted(value, mask)
 
 
+def _sanitize_alpha_target(alpha: Tensor) -> Tensor:
+    return torch.nan_to_num(alpha.float(), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+
+
 @torch.jit.script
 def _laplacian_pyramid_loss(
     pred: Tensor,
@@ -294,7 +298,7 @@ class V3MattingLossComputer(nn.Module):
 
         # --- Cast to fp32 ---
         alpha_p = alpha_pred.float()
-        alpha_g = alpha_gt.float()
+        alpha_g = _sanitize_alpha_target(alpha_gt)
         fg_p = fg_pred.float()
         fg_g = fg_gt.float()
 

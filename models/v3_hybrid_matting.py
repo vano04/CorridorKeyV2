@@ -183,12 +183,23 @@ class V3HybridVideoMattingModel(nn.Module):
         reference_dropout: float = 0.25,
         # Native detail refiner
         use_native_refiner: bool = True,
-        native_refiner_blocks: int = 3,
+        native_refiner_blocks: int = 8,
         native_refiner_hidden: int = 64,
         native_refiner_chunk_frames: int = 2,
-        max_alpha_delta: float = 0.25,
-        max_fg_delta: float = 0.15,
-        max_spill_delta: float = 0.10,
+        native_refiner_num_heads: int = 4,
+        native_refiner_head_dim: int = 16,
+        native_refiner_mlp_ratio: float = 2.0,
+        native_refiner_window_sizes: Optional[Sequence[int]] = None,
+        native_refiner_shift_every_other_block: bool = True,
+        native_refiner_attention_backend: str = "linear",
+        native_refiner_attention_types: Optional[Sequence[str]] = None,
+        native_refiner_linear_feature_map: str = "elu_plus_one",
+        native_refiner_linear_attention_eps: float = 1.0e-6,
+        native_refiner_use_2d_rope: bool = True,
+        native_refiner_use_checkpointing: Optional[bool] = None,
+        max_alpha_delta: float = 0.03,
+        max_fg_delta: float = 0.02,
+        max_spill_delta: float = 0.15,
         # Performance
         gradient_checkpointing: bool = False,
         decoder_out_dim: int = 256,
@@ -289,6 +300,21 @@ class V3HybridVideoMattingModel(nn.Module):
                 max_spill_delta=max_spill_delta,
                 predict_spill=predict_spill_mask,
                 global_context_dim=global_context_dim,
+                num_heads=native_refiner_num_heads,
+                head_dim=native_refiner_head_dim,
+                mlp_ratio=native_refiner_mlp_ratio,
+                window_sizes=native_refiner_window_sizes,
+                shift_every_other_block=native_refiner_shift_every_other_block,
+                attention_backend=native_refiner_attention_backend,
+                attention_types=native_refiner_attention_types,
+                linear_feature_map=native_refiner_linear_feature_map,
+                linear_attention_eps=native_refiner_linear_attention_eps,
+                use_2d_rope=native_refiner_use_2d_rope,
+                use_checkpointing=(
+                    gradient_checkpointing
+                    if native_refiner_use_checkpointing is None
+                    else native_refiner_use_checkpointing
+                ),
             )
         else:
             self.native_refiner = None
@@ -555,6 +581,7 @@ class V3HybridVideoMattingModel(nn.Module):
                 refiner_out = {key: torch.cat(values, dim=1) for key, values in refiner_chunks.items()}
                 alpha_pred, fg_pred = refiner_out["alpha_refined"], refiner_out["fg_refined"]
                 if "spill_refined" in refiner_out: spill_mask_pred = refiner_out["spill_refined"]
+                if "uncertainty_refined" in refiner_out: uncertainty_pred = refiner_out["uncertainty_refined"]
                 refine_mask = torch.maximum(alpha_refine_mask_full, fg_refine_mask_full).reshape(b*t, 1, h, w)
 
             comp_pred = _composite_fg(fg_pred, bg_for_comp if bg_for_comp is not None else video, alpha_pred, self.fg_representation)
@@ -565,10 +592,20 @@ class V3HybridVideoMattingModel(nn.Module):
             if quality_eval_pred is not None: out["quality_eval_pred"] = quality_eval_pred
             if self.native_refiner is not None:
                 out.update({"native_alpha_delta_pred": refiner_out["native_alpha_delta_pred"], "native_fg_delta_pred": refiner_out["native_fg_delta_pred"], "refine_mask": refine_mask.reshape(b, t, 1, h, w)})
+                if "native_spill_delta_pred" in refiner_out:
+                    out["native_spill_delta_pred"] = refiner_out["native_spill_delta_pred"]
+                if "native_uncertainty_delta_pred" in refiner_out:
+                    out["native_uncertainty_delta_pred"] = refiner_out["native_uncertainty_delta_pred"]
             return out
 
 
 def build_v3_hybrid_video_matting_model(config: Dict[str, Any]) -> V3HybridVideoMattingModel:
+    refine_head = config.get("refine_head") or {}
+    if refine_head:
+        head_type = str(refine_head.get("type", "native_window_linear_attention")).strip().lower()
+        if head_type not in {"native_window_linear_attention", "native_window_linear", "linear"}:
+            raise ValueError(f"Unsupported refine_head.type={head_type!r}")
+
     return V3HybridVideoMattingModel(
         patch_size=int(config.get("patch_size", 8)),
         embed_dims=tuple(config.get("embed_dims", [128, 256, 384, 512])),
@@ -599,12 +636,23 @@ def build_v3_hybrid_video_matting_model(config: Dict[str, Any]) -> V3HybridVideo
         num_reference_frames=int(config.get("num_reference_frames", 2)),
         reference_dropout=float(config.get("reference_dropout", 0.25)),
         use_native_refiner=bool(config.get("use_native_refiner", True)),
-        native_refiner_blocks=int(config.get("native_refiner_blocks", 3)),
-        native_refiner_hidden=int(config.get("native_refiner_hidden", 64)),
+        native_refiner_blocks=int(refine_head.get("depth", config.get("native_refiner_blocks", 8))),
+        native_refiner_hidden=int(refine_head.get("embed_dim", config.get("native_refiner_hidden", 64))),
         native_refiner_chunk_frames=int(config.get("native_refiner_chunk_frames", 2)),
-        max_alpha_delta=float(config.get("native_refiner_max_alpha_delta", config.get("max_alpha_delta", 0.25))),
-        max_fg_delta=float(config.get("native_refiner_max_fg_delta", config.get("max_fg_delta", 0.15))),
-        max_spill_delta=float(config.get("native_refiner_max_spill_delta", config.get("max_spill_delta", 0.10))),
+        native_refiner_num_heads=int(refine_head.get("num_heads", config.get("native_refiner_num_heads", 4))),
+        native_refiner_head_dim=int(refine_head.get("head_dim", config.get("native_refiner_head_dim", 16))),
+        native_refiner_mlp_ratio=float(refine_head.get("mlp_ratio", config.get("native_refiner_mlp_ratio", 2.0))),
+        native_refiner_window_sizes=refine_head.get("window_sizes", config.get("native_refiner_window_sizes")),
+        native_refiner_shift_every_other_block=bool(refine_head.get("shift_every_other_block", config.get("native_refiner_shift_every_other_block", True))),
+        native_refiner_attention_backend=str(refine_head.get("attention_backend", config.get("native_refiner_attention_backend", "linear"))),
+        native_refiner_attention_types=refine_head.get("attention_types", config.get("native_refiner_attention_types")),
+        native_refiner_linear_feature_map=str(refine_head.get("linear_feature_map", config.get("native_refiner_linear_feature_map", "elu_plus_one"))),
+        native_refiner_linear_attention_eps=float(refine_head.get("linear_attention_eps", config.get("native_refiner_linear_attention_eps", 1.0e-6))),
+        native_refiner_use_2d_rope=bool(refine_head.get("use_2d_rope", config.get("native_refiner_use_2d_rope", True))),
+        native_refiner_use_checkpointing=refine_head.get("use_checkpointing", config.get("native_refiner_use_checkpointing")),
+        max_alpha_delta=float(refine_head.get("max_alpha_delta", config.get("native_refiner_max_alpha_delta", config.get("max_alpha_delta", 0.03)))),
+        max_fg_delta=float(refine_head.get("max_fg_delta", config.get("native_refiner_max_fg_delta", config.get("max_fg_delta", 0.02)))),
+        max_spill_delta=float(refine_head.get("max_spill_delta", config.get("native_refiner_max_spill_delta", config.get("max_spill_delta", 0.15)))),
         gradient_checkpointing=bool(config.get("gradient_checkpointing", False)),
         decoder_out_dim=int(config.get("decoder_out_dim", 256)),
         fp8_cfg=config.get("fp8"),

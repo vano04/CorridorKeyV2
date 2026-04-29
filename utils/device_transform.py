@@ -83,6 +83,15 @@ from matting_common import (
 
 
 _EPS = 1e-6
+_RAW_COLOR_MAX = 256.0
+
+
+def _sanitize_color_tensor(x: Tensor) -> Tensor:
+    return torch.nan_to_num(x, nan=0.0, posinf=_RAW_COLOR_MAX, neginf=0.0).clamp(0.0, _RAW_COLOR_MAX)
+
+
+def _sanitize_unit_tensor(x: Tensor) -> Tensor:
+    return torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
 
 
 def apply_green_foreground_augmentation(
@@ -470,9 +479,9 @@ class DeviceMattingTransform(nn.Module):
         cfg = self.cfg
         fg_representation = _validate_fg_representation(cfg.fg_representation)
 
-        fg = batch["fg_gt"]
-        bg = batch["bg_gt"]
-        alpha = batch["alpha_gt"]
+        fg = _sanitize_color_tensor(batch["fg_gt"])
+        bg = _sanitize_color_tensor(batch["bg_gt"])
+        alpha = _sanitize_unit_tensor(batch["alpha_gt"])
         emit_global_context = int(cfg.global_context_long_side) > 0
         precomputed_global = (
             emit_global_context
@@ -516,8 +525,8 @@ class DeviceMattingTransform(nn.Module):
 
         global_input_gt: Optional[Tensor]
         if emit_global_context and precomputed_global:
-            global_input_gt = batch["global_input_gt"].to(device=fg.device, dtype=fg.dtype)
-            global_alpha = batch["global_alpha_gt"].to(device=fg.device, dtype=alpha.dtype).clamp(0.0, 1.0)
+            global_input_gt = _sanitize_color_tensor(batch["global_input_gt"].to(device=fg.device, dtype=fg.dtype))
+            global_alpha = _sanitize_unit_tensor(batch["global_alpha_gt"].to(device=fg.device, dtype=alpha.dtype))
             global_fg = global_bg = None
         elif emit_global_context:
             global_input_gt = None
@@ -781,24 +790,25 @@ class DeviceMattingTransform(nn.Module):
         # is bounded by sigmoid in ``[0, 1]``; mixing an HDR ``fg_gt`` target
         # with a clamped ``input_gt`` target would let ``l_fg`` and ``l_comp``
         # disagree on the same pixel and their gradients would cancel out.
-        input_gt.clamp_(0.0, 1.0)
-        fg.clamp_(0.0, 1.0)
-        bg.clamp_(0.0, 1.0)
+        input_gt = _sanitize_unit_tensor(input_gt)
+        fg = _sanitize_unit_tensor(fg)
+        bg = _sanitize_unit_tensor(bg)
+        alpha = _sanitize_unit_tensor(alpha)
         if emit_global_context:
             assert global_alpha is not None
             if global_fg is not None:
-                global_fg = global_fg.clamp(0.0, 1.0)
+                global_fg = _sanitize_unit_tensor(global_fg)
                 global_fg, _ = _resize_long_side(
                     [global_fg, global_alpha],
                     int(cfg.global_context_long_side),
                 )
             if global_input_gt is not None:
-                global_input_gt.clamp_(0.0, 1.0)
+                global_input_gt = _sanitize_unit_tensor(global_input_gt)
                 global_input_gt, _ = _resize_long_side(
                     [global_input_gt, global_alpha],
                     int(cfg.global_context_long_side),
                 )
-            global_alpha = global_alpha.clamp(0.0, 1.0)
+            global_alpha = _sanitize_unit_tensor(global_alpha)
 
         # ---- coarse_alpha_init from first-frame alpha of every sample ----
         coarse = _generate_coarse_alpha_init_device(alpha[:, 0])

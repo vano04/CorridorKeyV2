@@ -17,6 +17,7 @@ from matting_common import (
 )
 
 EPS = 1e-6
+RAW_COLOR_MAX = 256.0
 
 # Tri-state switch for the B=1 zero-copy collate fast path:
 #   "auto" (default): enable when the per-sample tensor dtype is smaller
@@ -69,6 +70,20 @@ def _ensure_alpha_single_channel(alpha: Tensor) -> Tensor:
     if alpha.shape[1] == 1:
         return alpha
     return alpha[:, :1]
+
+
+def _sanitize_color_tensor(x: Tensor) -> Tensor:
+    """Keep source HDR finite without crushing real highlights.
+
+    CorridorKey EXRs are HDR, so values above 1.0 are expected.  We only
+    replace non-finite values and cap implausible infinities/overflows high
+    enough to preserve observed HDR clips before the final LDR training clamp.
+    """
+    return torch.nan_to_num(x, nan=0.0, posinf=RAW_COLOR_MAX, neginf=0.0).clamp_min(0.0).clamp_max(RAW_COLOR_MAX)
+
+
+def _sanitize_alpha_tensor(alpha: Tensor) -> Tensor:
+    return torch.nan_to_num(alpha, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
 
 
 def _green_foreground_challenge_premul(
@@ -475,14 +490,16 @@ class CorridorMattingTransform:
 
     def __call__(self, sample: Dict[str, object]) -> Dict[str, object]:
         fg_representation = _validate_fg_representation(self.fg_representation)
-        fg_gt = _ensure_color_three_channels(sample["FG"].to(torch.float32))
-        bg_gt = _ensure_color_three_channels(sample["BG"].to(torch.float32))
-        alpha_gt = _ensure_alpha_single_channel(sample["Alpha"].to(torch.float32)).clamp(0.0, 1.0)
+        fg_gt = _sanitize_color_tensor(_ensure_color_three_channels(sample["FG"].to(torch.float32)))
+        bg_gt = _sanitize_color_tensor(_ensure_color_three_channels(sample["BG"].to(torch.float32)))
+        alpha_gt = _sanitize_alpha_tensor(_ensure_alpha_single_channel(sample["Alpha"].to(torch.float32)))
 
         input_sample = sample.get("Input")
         input_provided = input_sample is not None
         if input_provided:
-            input_gt: Optional[Tensor] = _ensure_color_three_channels(input_sample.to(torch.float32))
+            input_gt: Optional[Tensor] = _sanitize_color_tensor(
+                _ensure_color_three_channels(input_sample.to(torch.float32))
+            )
         else:
             # Input is synthesized from FG/BG/Alpha below. We intentionally
             # defer that compose until AFTER the resize: on 2048x2048 fp32 the
@@ -506,11 +523,15 @@ class CorridorMattingTransform:
         global_fg_gt: Optional[Tensor] = None
         global_alpha_gt: Optional[Tensor] = None
         if global_input_sample is not None:
-            global_input_gt = _ensure_color_three_channels(global_input_sample.to(torch.float32))
+            global_input_gt = _sanitize_color_tensor(
+                _ensure_color_three_channels(global_input_sample.to(torch.float32))
+            )
         if global_fg_sample is not None:
-            global_fg_gt = _ensure_color_three_channels(global_fg_sample.to(torch.float32))
+            global_fg_gt = _sanitize_color_tensor(_ensure_color_three_channels(global_fg_sample.to(torch.float32)))
         if global_alpha_sample is not None:
-            global_alpha_gt = _ensure_alpha_single_channel(global_alpha_sample.to(torch.float32)).clamp(0.0, 1.0)
+            global_alpha_gt = _sanitize_alpha_tensor(
+                _ensure_alpha_single_channel(global_alpha_sample.to(torch.float32))
+            )
 
         # Apply the temporal reverse/dup/drop to every temporally-aligned tensor,
         # including optional precomputed global sidecars. This keeps local crops,
