@@ -1142,12 +1142,12 @@ def _checkerboard_linear(h: int, w: int, size: int = 128, dark_srgb: float = 0.1
     return linear.unsqueeze(0).repeat(3, 1, 1)
 
 
-def _fg_to_straight(fg: Tensor, alpha: Tensor, representation: str) -> Tensor:
+def _fg_to_straight(fg: Tensor, alpha: Tensor, representation: str, eps: float = 1e-3) -> Tensor:
     if representation == "straight":
         return fg
     if representation == "premul":
-        denom = alpha.clamp_min(_EPS)
-        return torch.where(alpha > _EPS, fg / denom, torch.zeros_like(fg))
+        denom = alpha.clamp_min(eps)
+        return torch.where(alpha > eps, fg / denom, torch.zeros_like(fg))
     raise ValueError(f"Unsupported fg representation {representation!r}")
 
 
@@ -1198,20 +1198,22 @@ def _save_frame_outputs(
     fg = fg.clamp(0.0, 1.0)
     if fg_source == "model":
         fg_straight = _fg_to_straight(fg, alpha, fg_representation).clamp(0.0, 1.0)
+        comp = _composite_over_checker(fg, alpha, fg_representation).clamp(0.0, 1.0)
+        fg_preview = fg if fg_representation == "premul" else fg_straight * alpha
     elif fg_source == "input":
         if input_path is None or input_info is None:
             raise ValueError("fg_source='input' requires input_path and input_info")
         full_frame = Tile(y0=0, y1=input_info.height, x0=0, x1=input_info.width)
         fg_straight = _read_input_tile(input_path, input_info, full_frame).clamp(0.0, 1.0)
+        comp = _composite_over_checker(fg_straight, alpha, "straight").clamp(0.0, 1.0)
+        fg_preview = (fg_straight * alpha).clamp(0.0, 1.0)
     else:
         raise ValueError(f"Unsupported fg_source={fg_source!r}")
-
-    comp = _composite_over_checker(fg_straight, alpha, "straight").clamp(0.0, 1.0)
 
     stem = f"{index:05d}"
 
     Image.fromarray(_to_uint8_alpha(alpha), mode="L").save(matte_dir / f"matte_{stem}.png")
-    Image.fromarray(_to_uint8_image(_linear_to_srgb_tensor(fg_straight)), mode="RGB").save(fg_dir / f"fg_{stem}.png")
+    Image.fromarray(_to_uint8_image(_linear_to_srgb_tensor(fg_preview)), mode="RGB").save(fg_dir / f"fg_{stem}.png")
     Image.fromarray(_to_uint8_rgba(fg_straight, alpha), mode="RGBA").save(processed_dir / f"processed_{stem}.png")
     Image.fromarray(_to_uint8_image(_linear_to_srgb_tensor(comp))).save(comp_dir / f"comp_{stem}.png")
 

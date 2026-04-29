@@ -114,11 +114,17 @@ class NativeDetailRefiner(nn.Module):
         uncertainty: Optional[Tensor],
         coarse_spill: Optional[Tensor],
         refine_mask: Optional[Tensor] = None,
+        alpha_refine_mask: Optional[Tensor] = None,
+        fg_refine_mask: Optional[Tensor] = None,
+        spill_refine_mask: Optional[Tensor] = None,
         global_tokens: Optional[Tensor] = None,
     ) -> Dict[str, Tensor]:
         """
         All inputs: [B*T, C, H, W] (temporal axis already folded).
-        refine_mask: [B*T, 1, H, W] soft gate from boundary/uncertainty detection.
+        refine_mask: [B*T, 1, H, W] legacy soft gate used for all residuals.
+        *_refine_mask: optional per-head gates. Alpha/spill usually want an
+            edge/uncertainty mask, while FG needs foreground-wide access to
+            restore native RGB detail instead of only touching the matte edge.
         global_tokens: [B, M, C] compact tokens (broadcast across T).
 
         Returns dict with:
@@ -163,14 +169,25 @@ class NativeDetailRefiner(nn.Module):
 
         # Bounded residuals
         gate = self.gate_head(x)
+        alpha_gate = gate
+        fg_gate = gate
+        spill_gate = gate
         if refine_mask is not None:
-            gate = gate * refine_mask
+            alpha_gate = alpha_gate * refine_mask
+            fg_gate = fg_gate * refine_mask
+            spill_gate = spill_gate * refine_mask
+        if alpha_refine_mask is not None:
+            alpha_gate = gate * alpha_refine_mask
+        if fg_refine_mask is not None:
+            fg_gate = gate * fg_refine_mask
+        if spill_refine_mask is not None:
+            spill_gate = gate * spill_refine_mask
 
         alpha_delta_raw = torch.tanh(self.alpha_delta(x)) * self.max_alpha_delta
         fg_delta_raw = torch.tanh(self.fg_delta(x)) * self.max_fg_delta
 
-        alpha_delta = alpha_delta_raw * gate
-        fg_delta = fg_delta_raw * gate
+        alpha_delta = alpha_delta_raw * alpha_gate
+        fg_delta = fg_delta_raw * fg_gate
 
         alpha_refined = (coarse_alpha + alpha_delta).clamp(0.0, 1.0)
         fg_refined = (coarse_fg + fg_delta).clamp(0.0, 1.0)
@@ -180,12 +197,12 @@ class NativeDetailRefiner(nn.Module):
             "fg_refined": fg_refined,
             "native_alpha_delta_pred": alpha_delta_raw,
             "native_fg_delta_pred": fg_delta_raw,
-            "refine_gate": gate,
+            "refine_gate": torch.maximum(alpha_gate, fg_gate),
         }
 
         if self.spill_delta is not None:
             spill_delta_raw = torch.tanh(self.spill_delta(x)) * self.max_spill_delta
-            spill_delta = spill_delta_raw * gate
+            spill_delta = spill_delta_raw * spill_gate
             coarse_s = coarse_spill if coarse_spill is not None else torch.zeros_like(coarse_alpha)
             spill_refined = (coarse_s + spill_delta).clamp(0.0, 1.0)
             out["spill_refined"] = spill_refined

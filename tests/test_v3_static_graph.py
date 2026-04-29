@@ -10,6 +10,7 @@ import torch
 from torch import Tensor
 
 from models import build_v3_hybrid_video_matting_model
+from models.native_detail_refiner import NativeDetailRefiner
 
 
 @pytest.fixture
@@ -79,3 +80,40 @@ def test_same_output_keys_with_zero_refine_mask(model):
     out2 = m(video=video, coarse_alpha_init=torch.zeros_like(coarse))
 
     assert set(out1.keys()) == set(out2.keys()), f"Key mismatch: {set(out1.keys())} vs {set(out2.keys())}"
+
+
+def test_native_refiner_uses_separate_fg_mask():
+    """FG detail refinement should work even when alpha refinement is masked off."""
+    refiner = NativeDetailRefiner(
+        in_channels=9,
+        hidden_channels=8,
+        num_blocks=1,
+        max_alpha_delta=0.5,
+        max_fg_delta=0.5,
+        predict_spill=False,
+        global_context_dim=0,
+    )
+    for p in refiner.parameters():
+        p.data.zero_()
+    refiner.gate_head[0].bias.data.fill_(10.0)
+    refiner.alpha_delta.bias.data.fill_(1.0)
+    refiner.fg_delta.bias.data.fill_(1.0)
+
+    rgb = torch.zeros(1, 3, 4, 4)
+    coarse_alpha = torch.full((1, 1, 4, 4), 0.5)
+    coarse_fg = torch.full((1, 3, 4, 4), 0.5)
+    zero_mask = torch.zeros(1, 1, 4, 4)
+    one_mask = torch.ones(1, 1, 4, 4)
+
+    out = refiner(
+        rgb=rgb,
+        coarse_alpha=coarse_alpha,
+        coarse_fg=coarse_fg,
+        uncertainty=None,
+        coarse_spill=None,
+        alpha_refine_mask=zero_mask,
+        fg_refine_mask=one_mask,
+    )
+
+    assert torch.allclose(out["alpha_refined"], coarse_alpha)
+    assert (out["fg_refined"] > coarse_fg).all()

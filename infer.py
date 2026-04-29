@@ -322,7 +322,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--amp-dtype", default="bf16", choices=("bf16", "fp16", "fp32"))
     parser.add_argument("--compile-model", action="store_true")
     parser.add_argument("--limit", type=int, default=0)
-    parser.add_argument("--fg-source", choices=("model", "input"), default="model")
+    parser.add_argument(
+        "--fg-source",
+        choices=("model", "input"),
+        default="model",
+        help=(
+            "Visible RGB source for FG/Processed/Comp PNGs. The default writes "
+            "the model-predicted foreground; 'input' keeps the original input "
+            "plate detail and uses the predicted alpha for comparison."
+        ),
+    )
     parser.add_argument("--make-video", action="store_true")
     parser.add_argument("--fps", type=float, default=24.0)
     parser.add_argument("--exr-decode-threads", type=int, default=4)

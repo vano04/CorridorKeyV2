@@ -520,10 +520,16 @@ class V3HybridVideoMattingModel(nn.Module):
             coarse_alpha_pred, coarse_fg_pred, coarse_spill_pred = alpha_pred, fg_pred, spill_mask_pred
 
             if self.native_refiner is not None:
-                refine_mask_full = _boundary_band(alpha_pred)
+                alpha_refine_mask_full = _boundary_band(alpha_pred)
                 if uncertainty_pred is not None:
-                    refine_mask_full = torch.maximum(refine_mask_full, uncertainty_pred)
-                refine_mask_full = refine_mask_full.clamp(0, 1)
+                    alpha_refine_mask_full = torch.maximum(alpha_refine_mask_full, uncertainty_pred)
+                alpha_refine_mask_full = alpha_refine_mask_full.clamp(0, 1)
+
+                # FG detail is not an edge-only problem. The decoder head predicts
+                # from 1/patch_size features and is then upsampled, so the native
+                # refiner must be allowed to adjust visible foreground interiors
+                # using the full-resolution RGB tile.
+                fg_refine_mask_full = alpha_pred.detach().clamp(0, 1)
 
                 chunk_frames = max(1, min(self.native_refiner_chunk_frames, t))
                 refiner_chunks: Dict[str, List[Tensor]] = {}
@@ -537,7 +543,9 @@ class V3HybridVideoMattingModel(nn.Module):
                         coarse_fg=fg_pred[:, t0:t1].reshape(b * tc, 3, h, w),
                         uncertainty=(uncertainty_pred[:, t0:t1].reshape(b * tc, 1, h, w) if uncertainty_pred is not None else None),
                         coarse_spill=(spill_mask_pred[:, t0:t1].reshape(b * tc, 1, h, w) if spill_mask_pred is not None else None),
-                        refine_mask=refine_mask_full[:, t0:t1].reshape(b * tc, 1, h, w),
+                        alpha_refine_mask=alpha_refine_mask_full[:, t0:t1].reshape(b * tc, 1, h, w),
+                        fg_refine_mask=fg_refine_mask_full[:, t0:t1].reshape(b * tc, 1, h, w),
+                        spill_refine_mask=alpha_refine_mask_full[:, t0:t1].reshape(b * tc, 1, h, w),
                         global_tokens=global_tokens,
                     )
                     for key, value in refiner_out_c.items():
@@ -547,7 +555,7 @@ class V3HybridVideoMattingModel(nn.Module):
                 refiner_out = {key: torch.cat(values, dim=1) for key, values in refiner_chunks.items()}
                 alpha_pred, fg_pred = refiner_out["alpha_refined"], refiner_out["fg_refined"]
                 if "spill_refined" in refiner_out: spill_mask_pred = refiner_out["spill_refined"]
-                refine_mask = refine_mask_full.reshape(b*t, 1, h, w)
+                refine_mask = torch.maximum(alpha_refine_mask_full, fg_refine_mask_full).reshape(b*t, 1, h, w)
 
             comp_pred = _composite_fg(fg_pred, bg_for_comp if bg_for_comp is not None else video, alpha_pred, self.fg_representation)
 
