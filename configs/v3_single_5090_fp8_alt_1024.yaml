@@ -63,15 +63,17 @@ model:
     fp8_recipe: delayed_scaling
 
 data:
+  dataset: local
   root_dir: "CorridorKeyDataset"
   multi_resolution_buckets: [384, 512]
-  batch_size_per_gpu: 1
+  batch_size: 1
   clip_len_min: 8
   clip_len_max: 8
   fixed_crop_size: 512
   fg_representation: premul
   device_augment: true
-  host_dtype: bf16
+  host_dtype: fp16
+  read_dtype: fp16
   num_torch_threads: 1
   horizontal_flip_p: 0.5
   background_replace_p: 0.3
@@ -164,8 +166,3 @@ loss:
   native_alpha_delta_reg: 0.10
   native_fg_delta_reg: 0.10
   quality_eval: 0.1
-
-ddp:
-  backend: nccl
-  find_unused_parameters: false
-  timeout_minutes: 30

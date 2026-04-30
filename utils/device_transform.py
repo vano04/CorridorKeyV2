@@ -39,13 +39,13 @@ RNG strategy
 
 * **Per-clip scalar decisions** (flip yes/no, gain values, kernel sizes,
   motion blur direction, ...) are sampled with Python ``random`` -- same
-  generator the CPU transform uses. ``train.set_seed`` already seeds it
-  per-rank, so device-mode and host-mode runs are bitwise reproducible
+  generator the CPU transform uses. ``train.set_seed`` already seeds it,
+  so device-mode and host-mode runs are bitwise reproducible
   modulo floating-point reassociation differences between CPU and CUDA.
 
 * **Per-pixel stochastic fields** (``torch.randn_like`` for sensor noise)
-  use the default CUDA generator, also seeded per-rank by
-  ``train.set_seed`` via ``torch.cuda.manual_seed_all``.
+  use the default CUDA generator, also seeded by ``train.set_seed`` via
+  ``torch.cuda.manual_seed``.
 
 Caveats
 =======
@@ -53,7 +53,7 @@ Caveats
 * **Batch-vs-sample augmentation diversity**: per-clip params are sampled
   once per *batch* call and broadcast across all ``B`` samples in the batch.
   The CPU transform samples per *sample* (called once per
-  ``Dataset.__getitem__``). For ``batch_size_per_gpu=1`` this is identical;
+  ``Dataset.__getitem__``). For ``batch_size=1`` this is identical;
   for ``B>1`` the device path applies the same augmentation params (flip
   decision, gain values, blur kernel, ...) to every sample in the batch,
   which is slightly less diverse. The relevant tile1024 perf configs all

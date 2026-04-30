@@ -53,8 +53,9 @@ model:
   native_refiner_max_spill_delta: 0.10
 
 data:
+  dataset: local
   dataset_root: "CorridorKeyDataset"
-  batch_size_per_gpu: 1
+  batch_size: 1
   clip_len_min: 2
   clip_len_max: 4
   fixed_crop_size: 256
@@ -63,7 +64,8 @@ data:
   decode_full_frame: true
   emit_global_context: true
   global_context_long_side: 256
-  host_dtype: bf16
+  host_dtype: fp16
+  read_dtype: fp16
   num_workers: 2
   pin_memory: true
   horizontal_flip_p: 0.0
@@ -126,9 +128,3 @@ loss:
   native_alpha_delta_reg: 0.05
   native_fg_delta_reg: 0.05
   quality_eval: 0.1
-
-ddp:
-  backend: nccl
-  find_unused_parameters: false
-  static_graph: false
-  timeout_minutes: 5

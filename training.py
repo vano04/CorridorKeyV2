@@ -21,9 +21,6 @@ import math
 import os
 import random
 import signal
-import threading
-import time
-import uuid
 from collections import OrderedDict
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -32,13 +29,9 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 # Process-wide environment defaults, applied BEFORE torch import so they
-# influence threading-library initialisation, the CUDA caching allocator
-# layout, and NCCL's transport selection. ``setdefault`` so any user-set
-# value (e.g. NCCL_DEBUG=INFO from torchrun) is preserved.
+# influence threading-library initialisation and the CUDA caching allocator.
+# ``setdefault`` keeps any user-provided environment overrides intact.
 #
-#   CUDA_VISIBLE_DEVICES=0,1,2,3
-#       Default to the four local training GPUs when the launcher does not
-#       explicitly scope devices. User-provided CUDA_VISIBLE_DEVICES still wins.
 #   OMP_NUM_THREADS=2 and MKL/NUMEXPR_NUM_THREADS=1
 #       Each DataLoader worker can spawn its own OpenMP/MKL pool. Without
 #       this cap, ``num_workers`` workers each grabbing N threads
@@ -46,17 +39,6 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 #       throughput lost to context switches). The workers individually
 #       call ``torch.set_num_threads(num_torch_threads)`` for the few
 #       transform ops that actually benefit from parallel CPU.
-#   TORCH_NCCL_ASYNC_ERROR_HANDLING=1
-#       Surfaces NCCL collective failures as Python exceptions instead of
-#       silently hanging the rank. Cheap insurance for multi-GPU runs;
-#       no-op on single-GPU hosts.
-#   NCCL_IB_DISABLE=1
-#       Single-node setup: skip InfiniBand probe and use NVLink/PCIe
-#       directly. Avoids ~3-5 s startup latency on hosts where IB is
-#       compiled in but not configured.
-#   NCCL_P2P_DISABLE=0
-#       Keep direct GPU peer-to-peer transfers enabled for the 4x local GPU
-#       training path.
 #   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 #       Lets the caching allocator grow a single contiguous segment instead
 #       of fragmenting into many fixed-size blocks. Big win for variable
@@ -69,22 +51,16 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 #       the transformer stages). 32 MB extra VRAM on a 32 GB card is
 #       trivial; the kernel speed-up is not.
 for _key, _val in (
-    ("CUDA_VISIBLE_DEVICES", "0,1,2,3"),
     ("OMP_NUM_THREADS", "2"),
     ("MKL_NUM_THREADS", "1"),
     ("NUMEXPR_NUM_THREADS", "1"),
-    ("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1"),
-    ("NCCL_IB_DISABLE", "1"),
-    ("NCCL_P2P_DISABLE", "0"),
     ("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"),
     ("CUBLAS_WORKSPACE_CONFIG", ":4096:8"),
 ):
     os.environ.setdefault(_key, _val)
 
 import torch
-import torch.distributed as dist
 from torch import nn
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.profiler import ProfilerActivity, schedule, tensorboard_trace_handler
@@ -98,13 +74,10 @@ from utils import (
     CorridorMattingTransform,
     DeviceMattingTransform,
     build_device_transform_from_data_cfg,
-    cleanup_distributed,
-    init_distributed,
     load_config,
     move_batch_to_device,
     pad_collate_video,
 )
-from utils.ddp import is_rank0, reduce_scalar
 from utils.ema import ModelEma
 from utils.nvtx_utils import nvtx_range
 from utils.wandb_logging import init_wandb_logger
@@ -154,12 +127,11 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def set_seed(seed: int, rank: int = 0) -> None:
-    full_seed = seed + rank
-    random.seed(full_seed)
-    torch.manual_seed(full_seed)
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(full_seed)
+        torch.cuda.manual_seed(seed)
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -172,6 +144,19 @@ def set_seed(seed: int, rank: int = 0) -> None:
     # bf16 inputs untouched -- so this is purely additive on top of the
     # bf16 autocast region.
     torch.set_float32_matmul_precision("high")
+
+
+def select_device(train_cfg: Dict[str, Any]) -> torch.device:
+    requested = str(train_cfg.get("device", "")).strip().lower()
+    if requested in {"cpu"}:
+        return torch.device("cpu")
+    if requested and requested not in {"cuda", "gpu"} and not requested.startswith("cuda:"):
+        raise ValueError("train.device must be 'cuda', 'cuda:N', or 'cpu' when provided.")
+    if requested.startswith("cuda:"):
+        if not torch.cuda.is_available():
+            raise RuntimeError(f"train.device={requested!r} requested CUDA, but CUDA is unavailable.")
+        return torch.device(requested)
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def iterate_device_batches(
@@ -253,7 +238,7 @@ class DatasetRuntime:
     module_name: str
     web_sequence_dataset_cls: Any
     sequence_dataset_cls: Any
-    create_ddp_dataloader: Callable[..., DataLoader]
+    create_dataloader: Callable[..., DataLoader]
     set_dataloader_epoch: Callable[[DataLoader, int], None]
 
 
@@ -264,7 +249,7 @@ def _import_dataset_runtime(module_name: str) -> DatasetRuntime:
     required = {
         "CorridorKeyWebSequenceDataset",
         "CorridorKeySequenceDataset",
-        "create_ddp_dataloader",
+        "create_single_gpu_dataloader",
         "set_dataloader_epoch",
     }
     missing = [symbol for symbol in sorted(required) if not hasattr(module, symbol)]
@@ -277,7 +262,7 @@ def _import_dataset_runtime(module_name: str) -> DatasetRuntime:
         module_name=module_name,
         web_sequence_dataset_cls=getattr(module, "CorridorKeyWebSequenceDataset"),
         sequence_dataset_cls=getattr(module, "CorridorKeySequenceDataset"),
-        create_ddp_dataloader=getattr(module, "create_ddp_dataloader"),
+        create_dataloader=getattr(module, "create_single_gpu_dataloader"),
         set_dataloader_epoch=getattr(module, "set_dataloader_epoch"),
     )
 
@@ -287,8 +272,6 @@ def resolve_dataset_runtime(data_cfg: Dict[str, Any]) -> DatasetRuntime:
     candidates = [
         preferred_module,
         "CorridorKeyDataset.dataset",
-        "CorridorKeyWebDataset.dataset",
-        "dataset",
     ]
 
     seen = set()
@@ -408,13 +391,11 @@ def cuda_warmup(
     With cudnn.benchmark=True, each unique spatial size triggers a one-time benchmark;
     doing it here moves that cost out of the training loop.
 
-    When *optimizer* is provided, AdamW state tensors (momentum / variance) are
-    explicitly pre-allocated and zero-initialised so the first real training
-    step does not pay the allocation cost. We deliberately do NOT call
+    When *optimizer* is provided we deliberately do NOT call
     ``optimizer.step()`` on the warmup gradients: the dummy loss only uses
     means of active outputs to keep gradient magnitudes small. We zero
-    gradients after the backward pass instead so cuDNN/CUDA caches and DDP
-    reducer buckets are still warmed without poisoning the optimizer state.
+    gradients after the backward pass instead so cuDNN/CUDA caches are
+    warmed without poisoning the optimizer state.
     """
     if device.type != "cuda":
         return
@@ -467,10 +448,9 @@ def cuda_warmup(
                 inference_options=warmup_opts,
                 **forward_kwargs,
             )
-            # Touch every active output branch so DDP sees stable parameter
-            # usage between warmup and real training iterations. Use mean()
-            # rather than sum() to keep gradient magnitudes small while still
-            # priming kernel selection, cache state, and reducer buckets.
+            # Touch every active output branch. Use mean() rather than sum()
+            # to keep gradient magnitudes small while still priming kernel
+            # selection and cache state.
             loss = out["alpha_pred"].mean() + out["fg_pred"].mean()
             uncertainty = out.get("uncertainty_pred")
             if uncertainty is not None:
@@ -504,7 +484,7 @@ def cuda_warmup(
     if not was_training:
         model.eval()
 
-    if verbose and is_rank0():
+    if verbose:
         print(f"CUDA warmup complete (compiled kernels for {len(resolution_buckets)} resolution buckets, t={t})")
 
 
@@ -566,139 +546,6 @@ def _atomic_torch_save(obj: Any, path: Path) -> None:
                 tmp_path.unlink()
         except OSError:
             pass
-
-
-def _atomic_write_text(path: Path, text: str) -> None:
-    """Write a small text marker atomically for cross-rank filesystem sync."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f".{path.name}.tmp.{os.getpid()}")
-    try:
-        tmp_path.write_text(text)
-        os.replace(tmp_path, path)
-    finally:
-        try:
-            if tmp_path.exists():
-                tmp_path.unlink()
-        except OSError:
-            pass
-
-
-def _safe_sync_name(name: str) -> str:
-    return "".join(c if c.isalnum() or c in "._-" else "_" for c in name)
-
-
-def _init_filesystem_sync_session(output_dir: Path, ddp: Any) -> str:
-    """Create a run-unique token shared by all ranks for marker filenames."""
-    if not ddp.is_distributed:
-        return "single"
-
-    session_obj: List[str | None] = [None]
-    if ddp.rank == 0:
-        elastic_id = os.environ.get("TORCHELASTIC_RUN_ID", "torchrun")
-        session_obj[0] = _safe_sync_name(f"{elastic_id}-{os.getpid()}-{uuid.uuid4().hex[:12]}")
-    dist.broadcast_object_list(session_obj, src=0)
-    session = session_obj[0]
-    if not session:
-        raise RuntimeError("failed to initialise distributed filesystem sync session")
-
-    (output_dir / ".ddp_sync" / session).mkdir(parents=True, exist_ok=True)
-    return session
-
-
-def _wait_for_checkpoint_marker(
-    done_path: Path,
-    failed_path: Path,
-    timeout_seconds: float,
-    poll_seconds: float,
-    description: str,
-) -> None:
-    deadline = time.monotonic() + timeout_seconds
-    while True:
-        if done_path.exists():
-            return
-        if failed_path.exists():
-            detail = failed_path.read_text(errors="replace").strip()
-            raise RuntimeError(f"{description} failed on rank 0: {detail}")
-        if time.monotonic() >= deadline:
-            raise TimeoutError(f"timed out waiting for {description} marker at {done_path}")
-        time.sleep(poll_seconds)
-
-
-def _filesystem_rendezvous(
-    sync_dir: Path,
-    rank: int,
-    world_size: int,
-    timeout_seconds: float,
-    poll_seconds: float,
-    description: str,
-) -> None:
-    """CPU/filesystem barrier used when a NCCL barrier would wait behind I/O."""
-    ready_path = sync_dir / f"rank{rank:05d}.ready"
-    _atomic_write_text(ready_path, f"pid={os.getpid()}\ntime={time.time():.6f}\n")
-
-    deadline = time.monotonic() + timeout_seconds
-    while True:
-        missing = [
-            r for r in range(world_size)
-            if not (sync_dir / f"rank{r:05d}.ready").exists()
-        ]
-        if not missing:
-            return
-        if time.monotonic() >= deadline:
-            raise TimeoutError(f"timed out waiting for ranks {missing} at {description}")
-        time.sleep(poll_seconds)
-
-
-def _save_checkpoint_with_filesystem_rendezvous(
-    *,
-    ddp: Any,
-    output_dir: Path,
-    sync_session: str,
-    sync_name: str,
-    timeout_seconds: float,
-    checkpoint_fn: Callable[[], None],
-) -> None:
-    """Run a rank-0 checkpoint save without parking peers in a NCCL barrier.
-
-    Rank 0 can spend a long time copying optimizer/model tensors to CPU and
-    flushing the checkpoint to disk. If peers enter ``dist.barrier()`` during
-    that window, the NCCL watchdog can abort the whole job even though nothing
-    is wrong with training. Marker files give us a slow but safe CPU rendezvous.
-    """
-    if not ddp.is_distributed:
-        checkpoint_fn()
-        return
-
-    sync_dir = output_dir / ".ddp_sync" / sync_session / _safe_sync_name(sync_name)
-    done_path = sync_dir / "rank0_checkpoint.done"
-    failed_path = sync_dir / "rank0_checkpoint.failed"
-    poll_seconds = 1.0
-
-    if ddp.rank == 0:
-        try:
-            checkpoint_fn()
-        except BaseException as exc:
-            _atomic_write_text(failed_path, f"{type(exc).__name__}: {exc}\n")
-            raise
-        else:
-            _atomic_write_text(done_path, "ok\n")
-    else:
-        _wait_for_checkpoint_marker(
-            done_path=done_path,
-            failed_path=failed_path,
-            timeout_seconds=timeout_seconds,
-            poll_seconds=poll_seconds,
-            description=sync_name,
-        )
-
-    _filesystem_rendezvous(
-        sync_dir=sync_dir,
-        rank=ddp.rank,
-        world_size=ddp.world_size,
-        timeout_seconds=timeout_seconds,
-        poll_seconds=poll_seconds,
-        description=sync_name,
-    )
 
 
 def save_checkpoint(
@@ -834,14 +681,14 @@ def maybe_compile_boundary_refine(
     model: nn.Module,
     model_cfg: Dict[str, Any],
     train_cfg: Dict[str, Any],
-    rank0_debug_console: bool,
+    debug_console_enabled: bool,
 ) -> nn.Module:
     if not bool(model_cfg.get("compile_boundary_refine", False)):
         return model
 
     if bool(train_cfg.get("compile", False)):
         _maybe_print(
-            rank0_debug_console,
+            debug_console_enabled,
             "compile_boundary_refine ignored because train.compile=true already wraps the full model.",
         )
         return model
@@ -849,7 +696,7 @@ def maybe_compile_boundary_refine(
     boundary_refine = getattr(model, "boundary_refine", None)
     if boundary_refine is None:
         _maybe_print(
-            rank0_debug_console,
+            debug_console_enabled,
             "compile_boundary_refine requested, but this model has no boundary_refine module.",
         )
         return model
@@ -857,7 +704,7 @@ def maybe_compile_boundary_refine(
     dynamic_default = bool(train_cfg.get("compile_dynamic", False))
     dynamic = bool(model_cfg.get("compile_boundary_refine_dynamic", dynamic_default))
     model.boundary_refine = torch.compile(boundary_refine, dynamic=dynamic)
-    _maybe_print(rank0_debug_console, f"torch.compile enabled for boundary_refine (dynamic={dynamic})")
+    _maybe_print(debug_console_enabled, f"torch.compile enabled for boundary_refine (dynamic={dynamic})")
     return model
 
 
@@ -1123,7 +970,7 @@ def build_optimizer_parameter_groups(
     return param_groups, stats
 
 
-def build_dataloader(config: Dict[str, Any], rank: int, world_size: int) -> DataLoader:
+def build_dataloader(config: Dict[str, Any]) -> DataLoader:
     data_cfg = config["data"]
     model_cfg = config["model"]
     debug_console = _resolve_debug_console_enabled(config)
@@ -1241,26 +1088,22 @@ def build_dataloader(config: Dict[str, Any], rank: int, world_size: int) -> Data
 
     sequence_length = int(max(data_cfg.get("clip_len_max", 12), data_cfg.get("dataset_sequence_length", 12)))
 
-    dataset_root = Path(data_cfg["root_dir"])
+    dataset_root = Path(data_cfg.get("root_dir", data_cfg.get("dataset_root", "CorridorKeyDataset")))
     shard_glob = str(data_cfg.get("shard_glob", "*.tar"))
     webdataset_root = resolve_webdataset_root(data_cfg=data_cfg, default_root=dataset_root, shard_glob=shard_glob)
 
-    explicit_dataset_type = str(data_cfg.get("dataset_type", "")).strip().lower()
-    root_has_shards = dataset_root.is_dir() and any(dataset_root.glob(shard_glob))
-    web_root_has_shards = (
-        webdataset_root is not None
-        and webdataset_root.is_dir()
-        and any(webdataset_root.glob(shard_glob))
-    )
+    dataset_source = str(data_cfg.get("dataset", data_cfg.get("dataset_type", "local"))).strip().lower()
+    if dataset_source in {"", "auto", "local", "filesystem", "fs", "webdataset", "wds", "tar"}:
+        dataset_source = "local"
+    elif dataset_source in {"web", "hf", "huggingface", "remote"}:
+        dataset_source = "web"
+    else:
+        raise ValueError(
+            f"data.dataset={data_cfg.get('dataset')!r} is not supported. "
+            "Use 'local' or 'web'."
+        )
 
-    use_webdataset = (
-        explicit_dataset_type in {"webdataset", "wds", "tar"}
-        or bool(data_cfg.get("dataset_is_sharded", False))
-        or root_has_shards
-        or web_root_has_shards
-    )
-
-    if use_webdataset and webdataset_root is not None:
+    if dataset_source == "local" and webdataset_root is not None:
         dataset_root = webdataset_root
 
     dataset_convert_to_float = _resolve_bool_cfg(
@@ -1288,48 +1131,48 @@ def build_dataloader(config: Dict[str, Any], rank: int, world_size: int) -> Data
         "global_context_root_dir": data_cfg.get("global_context_root_dir"),
         "global_context_long_side": int(data_cfg.get("global_context_long_side", 0)),
         "global_context_modalities": data_cfg.get("global_context_modalities", ["Input", "Alpha"]),
-        "webdataset_repo_id": str(data_cfg.get("webdataset_repo_id", "Vano04/CorridorKeyDataset_Custom")),
+        "webdataset_repo_id": str(data_cfg.get("webdataset_repo_id", "vano04/CorridorKeyDataset_Custom")),
         "web_shard_cache_dir": data_cfg.get("web_shard_cache_dir"),
         "web_shard_cache_max_shards": int(data_cfg.get("web_shard_cache_max_shards", 3)),
         "web_shard_delete_after_use": bool(data_cfg.get("web_shard_delete_after_use", False)),
         "web_shard_download_retries": int(data_cfg.get("web_shard_download_retries", 6)),
         "web_shard_download_timeout_s": int(data_cfg.get("web_shard_download_timeout_s", 120)),
+        "dataset_source": "web" if dataset_source == "web" else "local",
+        "dtype": data_cfg.get("read_dtype", data_cfg.get("dataset_dtype", "fp16")),
+        "preindex_shards": bool(data_cfg.get("preindex_shards", True)),
     }
 
-    if use_webdataset:
-        validation_shards_cfg = data_cfg.get(
-            "validation_shard_indices",
-            data_cfg.get("validation_shards", [33]),
-        )
-        if validation_shards_cfg is None:
-            validation_shard_indices = []
-        elif isinstance(validation_shards_cfg, str):
-            validation_shard_indices = [
-                int(part.strip())
-                for part in validation_shards_cfg.split(",")
-                if part.strip()
-            ]
-        elif isinstance(validation_shards_cfg, (list, tuple, set)):
-            validation_shard_indices = [int(v) for v in validation_shards_cfg]
-        else:
-            validation_shard_indices = [int(validation_shards_cfg)]
-
-        dataset = dataset_runtime.web_sequence_dataset_cls(
-            **dataset_kwargs,
-            shard_glob=shard_glob,
-            manifest_filename=str(data_cfg.get("manifest_filename", "clips_manifest.jsonl")),
-            split=str(data_cfg.get("webdataset_split", "train")),
-            validation_shard_indices=validation_shard_indices,
-        )
+    validation_shards_cfg = data_cfg.get(
+        "validation_shard_indices",
+        data_cfg.get("validation_shards", [33]),
+    )
+    if validation_shards_cfg is None:
+        validation_shard_indices = []
+    elif isinstance(validation_shards_cfg, str):
+        validation_shard_indices = [
+            int(part.strip())
+            for part in validation_shards_cfg.split(",")
+            if part.strip()
+        ]
+    elif isinstance(validation_shards_cfg, (list, tuple, set)):
+        validation_shard_indices = [int(v) for v in validation_shards_cfg]
     else:
-        dataset = dataset_runtime.sequence_dataset_cls(**dataset_kwargs)
+        validation_shard_indices = [int(validation_shards_cfg)]
+
+    dataset = dataset_runtime.web_sequence_dataset_cls(
+        **dataset_kwargs,
+        shard_glob=shard_glob,
+        manifest_filename=str(data_cfg.get("manifest_filename", "manifest.json")),
+        split=str(data_cfg.get("webdataset_split", data_cfg.get("split", "train"))),
+        validation_shard_indices=validation_shard_indices,
+    )
 
     pad_multiple = int(model_cfg.get("patch_size", 8))
     collate_fn = lambda batch: pad_collate_video(batch, pad_multiple=pad_multiple)
 
-    loader = dataset_runtime.create_ddp_dataloader(
+    loader = dataset_runtime.create_dataloader(
         dataset=dataset,
-        batch_size=int(data_cfg.get("batch_size_per_gpu", 1)),
+        batch_size=int(data_cfg.get("batch_size", 1)),
         num_workers=int(data_cfg.get("num_workers", 4)),
         shuffle=bool(data_cfg.get("shuffle", True)),
         drop_last=bool(data_cfg.get("drop_last", False)),
@@ -1337,8 +1180,6 @@ def build_dataloader(config: Dict[str, Any], rank: int, world_size: int) -> Data
         persistent_workers=bool(data_cfg.get("persistent_workers", True)),
         prefetch_factor=int(data_cfg.get("prefetch_factor", 2)),
         seed=int(data_cfg.get("seed", 1337)),
-        rank=rank,
-        world_size=world_size,
         collate_fn=collate_fn,
         num_torch_threads=int(data_cfg.get("num_torch_threads", 1)),
         exr_internal_threads=int(data_cfg.get("exr_internal_threads", 0)),
@@ -1346,10 +1187,10 @@ def build_dataloader(config: Dict[str, Any], rank: int, world_size: int) -> Data
 
     setattr(loader, "_corridorkey_set_dataloader_epoch", dataset_runtime.set_dataloader_epoch)
 
-    if rank == 0 and debug_console:
+    if debug_console:
         print(
             f"Dataset module={dataset_runtime.module_name} "
-            f"mode={'webdataset' if use_webdataset else 'filesystem'} root={dataset_root} "
+            f"mode={dataset_source} root={dataset_root} "
             f"modalities={modalities} convert_to_float={dataset_convert_to_float}"
         )
 
@@ -1364,20 +1205,12 @@ def train() -> None:
     cfg = load_config(args.config)
     debug_console = _resolve_debug_console_enabled(cfg, args=args)
 
-    ddp_cfg = cfg.get("ddp", {})
-    ddp_timeout_minutes_cfg = ddp_cfg.get("timeout_minutes")
-    ddp_timeout_minutes = (
-        float(ddp_timeout_minutes_cfg) if ddp_timeout_minutes_cfg is not None else None
-    )
-    ddp = init_distributed(
-        backend=str(ddp_cfg.get("backend", "nccl")),
-        timeout_minutes=ddp_timeout_minutes,
-    )
-    rank0_debug_console = bool(debug_console and ddp.rank == 0)
-
-    set_seed(args.seed, rank=ddp.rank)
-
     train_cfg = cfg["train"]
+    device = select_device(train_cfg)
+    debug_console_enabled = bool(debug_console)
+
+    set_seed(args.seed)
+
     model_cfg = dict(cfg["model"])
     model_cfg.setdefault("fg_representation", str(cfg["data"].get("fg_representation", "premul")))
     if "rematerialize_activations" in train_cfg:
@@ -1395,7 +1228,7 @@ def train() -> None:
         )
     enable_boundary_refine_train = bool(train_cfg.get("enable_boundary_refine", False))
 
-    dataloader = build_dataloader(cfg, rank=ddp.rank, world_size=ddp.world_size)
+    dataloader = build_dataloader(cfg)
 
     # Mirror the ``device_augment`` flag into a GPU-side transform module.
     # When set, ``CorridorMattingTransform`` (constructed inside
@@ -1403,7 +1236,7 @@ def train() -> None:
     # leaves the spatial crop + photometric augments + composite +
     # ``coarse_alpha_init`` for ``device_transform`` to materialise after
     # H2D. Eager mode -- runs outside the compiled model graph and uses
-    # default CUDA RNG (already seeded per-rank by ``set_seed``).
+    # default CUDA RNG (already seeded by ``set_seed``).
     device_augment = bool(cfg["data"].get("device_augment", False))
     device_transform: DeviceMattingTransform | None = None
     if train_inference_mode == "hybrid":
@@ -1416,16 +1249,16 @@ def train() -> None:
         # global context from the local ROI, which is less ideal but keeps the
         # run usable while sidecars are being generated.
     if device_augment:
-        if ddp.device.type != "cuda":
+        if device.type != "cuda":
             raise ValueError(
                 "data.device_augment=true requires a CUDA device. "
                 "Either run on GPU or unset device_augment in the config."
             )
         device_transform = build_device_transform_from_data_cfg(
             cfg["data"], cfg.get("train", {})
-        ).to(ddp.device).eval()
+        ).to(device).eval()
         _maybe_print(
-            rank0_debug_console,
+            debug_console_enabled,
             (
                 "GPU augment enabled: CPU pipeline emits "
                 + ("native-res" if bool(cfg["data"].get("decode_full_frame", False)) else "OpenEXR tile-ROI")
@@ -1434,9 +1267,9 @@ def train() -> None:
             ),
         )
 
-    model = build_v3_hybrid_video_matting_model(model_cfg).to(ddp.device)
+    model = build_v3_hybrid_video_matting_model(model_cfg).to(device)
 
-    if ddp.device.type == "cuda":
+    if device.type == "cuda":
         model = model.to(memory_format=torch.channels_last)
 
     if train_inference_mode == "full" and not enable_boundary_refine_train:
@@ -1451,17 +1284,17 @@ def train() -> None:
                     frozen_numel += p.numel()
             if frozen_tensors > 0:
                 _maybe_print(
-                    rank0_debug_console,
+                    debug_console_enabled,
                     "Training notice: boundary_refine is inactive for mode='full'; "
                     f"froze {frozen_tensors} tensors ({frozen_numel:,} params) "
-                    "to reduce DDP communication overhead.",
+                    "to skip unused optimizer work.",
                 )
 
     model = maybe_compile_boundary_refine(
         model=model,
         model_cfg=model_cfg,
         train_cfg=train_cfg,
-        rank0_debug_console=rank0_debug_console,
+        debug_console_enabled=debug_console_enabled,
     )
 
     if bool(train_cfg.get("compile", False)):
@@ -1479,129 +1312,21 @@ def train() -> None:
         # config in the repo was written against.
         compile_dynamic = bool(train_cfg.get("compile_dynamic", True))
         model = torch.compile(model, dynamic=compile_dynamic)
-        _maybe_print(rank0_debug_console, f"torch.compile enabled (dynamic={compile_dynamic})")
-
-    if ddp.is_distributed and bool(ddp_cfg.get("sync_bn", False)):
-        model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
-
-    if ddp.is_distributed:
-        configured_find_unused = bool(ddp_cfg.get("find_unused_parameters", False))
-        boundary_refine = getattr(model, "boundary_refine", None)
-        has_trainable_boundary_refine = (
-            boundary_refine is not None
-            and any(p.requires_grad for p in boundary_refine.parameters())
-        )
-        effective_find_unused = configured_find_unused
-        if not effective_find_unused and train_inference_mode == "full" and has_trainable_boundary_refine:
-            effective_find_unused = True
-            _maybe_print(
-                rank0_debug_console,
-                "DDP notice: enabling find_unused_parameters because trainable "
-                "boundary_refine parameters are inactive in mode='full'.",
-            )
-        # Tiled mode can skip boundary-refine tiles when the data-dependent
-        # refine mask is empty, which may leave boundary_refine without grad on
-        # that step. Lowres mode uses the full-frame refiner path and calls the
-        # refiner every iteration, so it can keep find_unused_parameters=false.
-        if (
-            not effective_find_unused
-            and train_inference_mode == "tiled"
-            and has_trainable_boundary_refine
-        ):
-            effective_find_unused = True
-            _maybe_print(
-                rank0_debug_console,
-                "DDP notice: enabling find_unused_parameters because the "
-                "boundary refiner only receives gradient on steps whose GT "
-                "alpha contains soft edges; some batches will leave its "
-                "params without grad.",
-            )
-
-        static_graph_cfg = ddp_cfg.get("static_graph", None)
-        use_static_graph = (not effective_find_unused) if static_graph_cfg is None else bool(static_graph_cfg)
-        if effective_find_unused and use_static_graph:
-            use_static_graph = False
-            _maybe_print(
-                rank0_debug_console,
-                "DDP notice: disabling static_graph because find_unused_parameters=True.",
-            )
-        # Boundary/refiner training can have a dynamic autograd graph across
-        # temporal chunks or data-dependent tiled refine masks, so static_graph
-        # -- which asserts an identical graph every iteration -- can throw
-        # mid-training. Default it off whenever the refiner is live, unless the
-        # user explicitly opts back in.
-        refiner_active = (
-            train_inference_mode in {"lowres", "tiled", "hybrid"} and has_trainable_boundary_refine
-        )
-        if refiner_active and use_static_graph and static_graph_cfg is None:
-            use_static_graph = False
-            _maybe_print(
-                rank0_debug_console,
-                "DDP notice: disabling static_graph because the boundary "
-                f"refiner is active (inference_mode='{train_inference_mode}'); "
-                "its data-dependent gating is not compatible with a static graph.",
-            )
-
-        ddp_kwargs = {
-            "module": model,
-            "device_ids": [ddp.local_rank] if ddp.device.type == "cuda" else None,
-            "output_device": ddp.local_rank if ddp.device.type == "cuda" else None,
-            "find_unused_parameters": effective_find_unused,
-            "broadcast_buffers": False,
-            "gradient_as_bucket_view": True,
-            "bucket_cap_mb": int(ddp_cfg.get("bucket_cap_mb", 100)),
-        }
-        if use_static_graph:
-            ddp_kwargs["static_graph"] = True
-
-        try:
-            model = DDP(**ddp_kwargs)
-        except TypeError:
-            ddp_kwargs.pop("static_graph", None)
-            model = DDP(**ddp_kwargs)
-
-        _maybe_print(
-            rank0_debug_console,
-            "DDP config: "
-            f"find_unused_parameters={effective_find_unused}, "
-            f"static_graph={use_static_graph}, "
-            f"bucket_cap_mb={ddp_kwargs['bucket_cap_mb']}",
-        )
-
-        grad_compression = str(ddp_cfg.get("grad_compression", "")).strip().lower()
-        if grad_compression in {"fp16", "bf16"}:
-            try:
-                from torch.distributed.algorithms.ddp_comm_hooks import default_hooks as ddp_default_hooks
-
-                hook = (
-                    ddp_default_hooks.bf16_compress_hook
-                    if grad_compression == "bf16"
-                    else ddp_default_hooks.fp16_compress_hook
-                )
-                model.register_comm_hook(state=None, hook=hook)
-                _maybe_print(
-                    rank0_debug_console,
-                    f"DDP comm hook enabled: {grad_compression} gradient compression",
-                )
-            except Exception as exc:
-                _maybe_print(
-                    rank0_debug_console,
-                    f"DDP comm hook warning: unable to enable {grad_compression} compression ({exc})",
-                )
+        _maybe_print(debug_console_enabled, f"torch.compile enabled (dynamic={compile_dynamic})")
 
     trainable_parameters = [p for p in model.parameters() if p.requires_grad]
     if not trainable_parameters:
         raise RuntimeError("No trainable parameters remain after applying training-time freezes.")
 
-    if rank0_debug_console:
+    if debug_console_enabled:
         total_numel = sum(p.numel() for p in model.parameters())
         trainable_numel = sum(p.numel() for p in trainable_parameters)
         print(f"Trainable parameters: {trainable_numel:,} / {total_numel:,}")
 
     fused_adamw_cfg = bool(train_cfg.get("fused_adamw", False))
-    fused_adamw = fused_adamw_cfg and ddp.device.type == "cuda"
+    fused_adamw = fused_adamw_cfg and device.type == "cuda"
     if fused_adamw_cfg and not fused_adamw:
-        _maybe_print(rank0_debug_console, "Training notice: fused_adamw=true ignored on non-CUDA device.")
+        _maybe_print(debug_console_enabled, "Training notice: fused_adamw=true ignored on non-CUDA device.")
 
     base_lr = float(train_cfg.get("lr", 1e-4))
     weight_decay = float(train_cfg.get("weight_decay", 1e-2))
@@ -1619,7 +1344,7 @@ def train() -> None:
         weight_decay=weight_decay,
         fused=fused_adamw,
     )
-    if rank0_debug_console:
+    if debug_console_enabled:
         group_desc = ", ".join(f"{k}={v:,}" for k, v in sorted(optimizer_group_stats.items()))
         print(f"Optimizer: AdamW(fused={fused_adamw}, groups={len(optimizer_param_groups)}) {group_desc}")
 
@@ -1651,22 +1376,22 @@ def train() -> None:
         min_lr_ratio=float(train_cfg.get("min_lr_ratio", 0.1)),
     )
     _maybe_print(
-        rank0_debug_console,
+        debug_console_enabled,
         f"LR schedule: warmup={int(train_cfg.get('warmup_steps', 5000))}, "
         f"total={total_steps}, base_lr={float(train_cfg.get('lr', 1e-4)):.2e}, "
         f"min_lr_ratio={float(train_cfg.get('min_lr_ratio', 0.1))}",
     )
     _maybe_print(
-        rank0_debug_console,
+        debug_console_enabled,
         f"Step accounting: dataloader_iters_per_epoch={len(dataloader)}, "
         f"grad_accum_steps={grad_accum_steps}, optimizer_steps_per_epoch={epoch_steps}",
     )
 
-    amp_enabled = bool(train_cfg.get("amp", True)) and ddp.device.type == "cuda"
+    amp_enabled = bool(train_cfg.get("amp", True)) and device.type == "cuda"
     amp_dtype_name = str(train_cfg.get("amp_dtype", "fp16")).lower()
     amp_dtype = torch.bfloat16 if amp_dtype_name == "bf16" else torch.float16
     use_scaler = amp_enabled and amp_dtype == torch.float16
-    scaler_device = ddp.device.type if ddp.device.type in {"cuda", "cpu"} else "cuda"
+    scaler_device = device.type if device.type in {"cuda", "cpu"} else "cuda"
     scaler = torch.amp.GradScaler(scaler_device, enabled=use_scaler)
 
     ema_cfg = dict(train_cfg.get("ema", {}) or {})
@@ -1680,15 +1405,15 @@ def train() -> None:
     elif ema_device_name == "cpu":
         ema_device = torch.device("cpu")
     elif ema_device_name in {"cuda", "gpu"}:
-        ema_device = ddp.device if ddp.device.type == "cuda" else None
+        ema_device = device if device.type == "cuda" else None
         if ema_device is None:
-            _maybe_print(rank0_debug_console, "Training notice: train.ema.device=cuda ignored on non-CUDA device.")
+            _maybe_print(debug_console_enabled, "Training notice: train.ema.device=cuda ignored on non-CUDA device.")
     else:
         raise ValueError("train.ema.device must be one of: model, cpu, cuda")
     model_ema = ModelEma(model, decay=ema_decay, device=ema_device) if ema_enabled else None
     if model_ema is not None:
         _maybe_print(
-            rank0_debug_console,
+            debug_console_enabled,
             f"Model EMA enabled: decay={ema_decay}, update_after_step={ema_update_after_step}, "
             f"update_every={ema_update_every}, device={ema_device_name or 'model'}",
         )
@@ -1696,7 +1421,7 @@ def train() -> None:
     criterion = V3MattingLossComputer(
         weights=loss_cfg,
         fg_representation=str(cfg["data"].get("fg_representation", "premul")),
-    ).to(ddp.device)
+    ).to(device)
 
     start_epoch = 0
     global_step = 0
@@ -1705,12 +1430,12 @@ def train() -> None:
             ckpt_epoch, ckpt_global_step = load_model_weights_only(
                 path=args.resume,
                 model=model,
-                device=ddp.device,
+                device=device,
             )
             if model_ema is not None:
                 model_ema.reset(model)
             _maybe_print(
-                rank0_debug_console,
+                debug_console_enabled,
                 f"Loaded model weights from {args.resume} "
                 f"(checkpoint epoch={ckpt_epoch}, global_step={ckpt_global_step}); "
                 "optimizer/scheduler/scaler reset for fresh schedule.",
@@ -1723,10 +1448,10 @@ def train() -> None:
                 scheduler=scheduler,
                 scaler=scaler if use_scaler else None,
                 model_ema=model_ema,
-                device=ddp.device,
+                device=device,
             )
             _maybe_print(
-                rank0_debug_console,
+                debug_console_enabled,
                 f"Resumed from {args.resume}, start_epoch={start_epoch}, global_step={global_step}",
             )
 
@@ -1746,48 +1471,45 @@ def train() -> None:
             train_cfg.get("refine_on_spill_regions", inference_cfg.get("refine_on_spill_regions", True))
         ),
     )
-    _maybe_print(rank0_debug_console, f"Training inference mode: {train_inference_opts.mode}")
+    _maybe_print(debug_console_enabled, f"Training inference mode: {train_inference_opts.mode}")
 
     run_cuda_warmup = bool(train_cfg.get("cuda_warmup", True))
-    if ddp.device.type == "cuda" and run_cuda_warmup:
+    if device.type == "cuda" and run_cuda_warmup:
         data_cfg = cfg["data"]
         warmup_buckets = list(data_cfg.get("multi_resolution_buckets", [384, 512, 768, 1024]))
         warmup_input_dtype = torch.float32
         if bool(data_cfg.get("device_augment", False)):
             warmup_input_dtype = _resolve_host_dtype(data_cfg.get("host_dtype")) or torch.float32
         _maybe_print(
-            rank0_debug_console,
+            debug_console_enabled,
             f"Running CUDA warmup pass for resolution buckets {warmup_buckets}...",
         )
         cuda_warmup(
             model=model,
-            device=ddp.device,
+            device=device,
             amp_enabled=amp_enabled,
             amp_dtype=amp_dtype,
             patch_size=int(model_cfg.get("patch_size", 8)),
             temporal_batch_size=int(train_cfg.get("temporal_batch_size", 4)),
-            batch_size=int(cfg["data"].get("batch_size_per_gpu", 1)),
+            batch_size=int(cfg["data"].get("batch_size", 1)),
             input_dtype=warmup_input_dtype,
             resolution_buckets=warmup_buckets,
             inference_options=train_inference_opts,
             optimizer=optimizer,
             scaler=scaler if use_scaler else None,
-            verbose=rank0_debug_console,
+            verbose=debug_console_enabled,
         )
-        if ddp.is_distributed:
-            dist.barrier()
-    elif ddp.device.type == "cuda":
-        _maybe_print(rank0_debug_console, "CUDA warmup skipped (train.cuda_warmup=false).")
+    elif device.type == "cuda":
+        _maybe_print(debug_console_enabled, "CUDA warmup skipped (train.cuda_warmup=false).")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    filesystem_sync_session = _init_filesystem_sync_session(output_dir, ddp)
     wandb_logger = init_wandb_logger(
         cfg,
         output_dir=output_dir,
-        rank0=is_rank0(),
+        enabled_for_process=True,
         model=model,
-        debug_console=rank0_debug_console,
+        debug_console=debug_console_enabled,
     )
 
     epochs = int(train_cfg.get("epochs", 40))
@@ -1799,60 +1521,40 @@ def train() -> None:
         raise ValueError("train.wandb.loss_ema_decay must be >= 0.0 and < 1.0")
     wandb_loss_ema: float | None = None
     save_interval = int(train_cfg.get("save_interval", 1))
-    checkpoint_sync_timeout_minutes = float(
-        train_cfg.get(
-            "checkpoint_sync_timeout_minutes",
-            max(120.0, ddp.timeout.total_seconds() / 60.0 * 2.0),
-        )
-    )
-    checkpoint_sync_timeout_seconds = max(60.0, checkpoint_sync_timeout_minutes * 60.0)
-    sync_log_metrics = bool(train_cfg.get("sync_log_metrics", False))
     show_loss_in_pbar = bool(train_cfg.get("show_loss_in_pbar", False))
     profile_log_metrics = bool(train_cfg.get("profile_log_metrics", False))
-    ddp_sync_every_iter_cfg = train_cfg.get("ddp_sync_every_iter", None)
-    if ddp_sync_every_iter_cfg is None:
-        ddp_sync_every_iter = grad_accum_steps <= 1
-    else:
-        ddp_sync_every_iter = bool(ddp_sync_every_iter_cfg)
     pin_memory_enabled = bool(cfg["data"].get("pin_memory", True))
     cuda_prefetch_cfg = bool(train_cfg.get("cuda_prefetch", False))
-    cuda_prefetch = cuda_prefetch_cfg and pin_memory_enabled and ddp.device.type == "cuda"
+    cuda_prefetch = cuda_prefetch_cfg and pin_memory_enabled and device.type == "cuda"
     cuda_prefetch_queue = max(1, int(train_cfg.get("cuda_prefetch_queue", 1)))
     grad_clip = float(train_cfg.get("grad_clip", 1.0))
-    autocast_device = ddp.device.type
+    autocast_device = device.type
     activation_offload_mode = str(train_cfg.get("activation_offload", "")).strip().lower()
     activation_offload_cpu = (
         activation_offload_mode in {"cpu", "host"}
         or bool(train_cfg.get("activation_offload_cpu", False))
     )
     activation_offload_pin_memory = bool(train_cfg.get("activation_offload_pin_memory", True))
-    if activation_offload_cpu and ddp.device.type != "cuda":
+    if activation_offload_cpu and device.type != "cuda":
         _maybe_print(
-            rank0_debug_console,
+            debug_console_enabled,
             "Training notice: activation_offload=cpu ignored on non-CUDA device.",
         )
         activation_offload_cpu = False
 
-    if rank0_debug_console:
-        cadence = "every-iteration" if ddp_sync_every_iter else "optimizer-step-only"
-        print(f"DDP sync cadence: {cadence} (sync on final temporal chunk)")
+    if debug_console_enabled:
         if activation_offload_cpu:
             print(
                 "Activation offload: saved tensors for backward are staged on CPU "
                 f"(pin_memory={activation_offload_pin_memory})."
             )
-        if grad_accum_steps > 1 and ddp_sync_every_iter:
-            print(
-                "Training notice: grad_accum_steps>1 with ddp_sync_every_iter=true can "
-                "increase all-reduce overhead; consider ddp_sync_every_iter=false if communication dominates."
-            )
-        if cuda_prefetch_cfg and ddp.device.type == "cuda" and not pin_memory_enabled:
+        if cuda_prefetch_cfg and device.type == "cuda" and not pin_memory_enabled:
             print(
                 "Training notice: train.cuda_prefetch=true but data.pin_memory=false; "
                 "CUDA prefetch is disabled. Enable pin_memory for host-to-device overlap."
             )
 
-    # Fixed chunk count across all ranks so no rank idles while others still compute.
+    # Fixed chunk count keeps shape/control flow stable across temporal batches.
     # +1 is only needed when temporal jitter can duplicate a frame.
     clip_len_max = int(cfg["data"].get("clip_len_max", 12))
     temporal_jitter_p = float(cfg["data"].get("temporal_jitter_p", 0.1))
@@ -1882,7 +1584,7 @@ def train() -> None:
         profile_wait = 1
         auto_adjusted_profile_schedule = True
 
-    profiling = args.profile and ddp.device.type == "cuda" and is_rank0()
+    profiling = args.profile and device.type == "cuda"
     prof: torch.profiler.profile | None = None
     profile_total_steps = 0
     if profiling:
@@ -1890,7 +1592,7 @@ def train() -> None:
         profile_dir.mkdir(parents=True, exist_ok=True)
         profile_total_steps = profile_wait + profile_warmup + profile_active
         print(
-            f"Profiling enabled (rank 0 only): wait={profile_wait}, warmup={profile_warmup}, "
+            f"Profiling enabled: wait={profile_wait}, warmup={profile_warmup}, "
             f"active={profile_active} → {profile_total_steps} iterations then exit"
         )
         if auto_adjusted_profile_schedule:
@@ -1918,356 +1620,44 @@ def train() -> None:
             acc_events=True,
         )
         prof.start()
-    elif args.profile and ddp.device.type == "cuda" and not is_rank0():
-        profile_total_steps = profile_wait + profile_warmup + profile_active
-
     _interrupted = False
     profile_finished = False
     prof_stopped = False
     max_steps_reached = False
 
-    # ------------------------------------------------------------------
-    # Interrupt-handling strategy (rewritten after multiple failed attempts
-    # at a "polled flag + cooperative break" cleanup).
-    #
-    # Empirical findings from the runtime logs:
-    #   * Python signal handlers run on the main thread *between bytecodes*.
-    #     Whichever rank happens to be at a Python boundary when SIGINT/
-    #     SIGTERM lands runs its handler immediately; ranks that are inside
-    #     a long C-level call (CUDA kernel launch queue, NCCL collective,
-    #     DataLoader/queue.get auto-retry under PEP 475, etc.) may never run
-    #     their handler before torchrun's elastic agent escalates to SIGKILL.
-    #   * Cooperative shutdown via a polled ``_interrupted`` flag is therefore
-    #     unreliable: only some ranks see it, the surviving ranks then race
-    #     each other through ``cleanup_distributed`` and stall NCCL teardown.
-    #
-    # New strategy:
-    #   1. The signal handler does the emergency checkpoint save *itself*,
-    #      synchronously. Doing I/O in a Python signal handler is safe (it
-    #      runs in the main thread, not a real signal context). All ranks
-    #      hold the same DDP-averaged params + identical optimizer state, so
-    #      whichever rank's handler fires first wins a filesystem lock and
-    #      writes the canonical checkpoint - we no longer depend on rank 0
-    #      specifically being lucky enough to escape its CUDA call.
-    #   2. The handler then arms a daemon ``threading.Timer`` that calls
-    #      ``os._exit`` after a small grace period. This guarantees the
-    #      worker exits even if the cooperative path is wedged. The timer
-    #      thread runs independently of the main thread, so a stuck CUDA
-    #      call does not block the force-exit.
-    #   3. The legacy polled-flag path is kept as a "best effort" soft
-    #      shutdown for the lucky case where every rank actually breaks out.
-    # ------------------------------------------------------------------
-
-    # Mutable container so the handler closure reads the *latest* loop
-    # values at the moment the signal fires (closure cells alone don't help
-    # here, because ``epoch`` is a for-loop target that may not be bound
-    # yet when the first signal arrives).
-    _handler_state = {"epoch": start_epoch, "global_step": int(global_step)}
-    _emergency_save_state = {"in_progress": False, "done": False, "path": None}
-    _force_exit_state: Dict[str, Any] = {"timer": None}
-    _interrupt_lock_path = output_dir / ".interrupted_save.lock"
-
-    # Clear any stale lock from a previous interrupted run so this run can
-    # write its own emergency checkpoint when needed.
-    if is_rank0():
-        try:
-            _interrupt_lock_path.unlink()
-        except FileNotFoundError:
-            pass
-        except OSError:
-            pass
-
-    _sigint_count = {"n": 0}
-
-    def _emergency_save_in_handler() -> None:
-        """Best-effort synchronous checkpoint write from the signal handler.
-
-        Any rank may win the filesystem lock; in DDP every rank holds the
-        same averaged parameters and identical optimizer state, so whichever
-        one fires its handler first writes the canonical ``checkpoint_
-        interrupted_step*.pt``. This is the key reliability win over the
-        previous "only rank 0 saves in finally" path, which silently lost
-        the run whenever rank 0 was stuck inside a C call when the signal
-        arrived.
-        """
-        if _emergency_save_state["in_progress"] or _emergency_save_state["done"]:
-            return
-        _emergency_save_state["in_progress"] = True
-        try:
-            try:
-                fd = os.open(
-                    str(_interrupt_lock_path),
-                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-                )
-                try:
-                    os.write(
-                        fd,
-                        f"rank={int(os.environ.get('RANK', '0'))} pid={os.getpid()}".encode(),
-                    )
-                finally:
-                    os.close(fd)
-            except FileExistsError:
-                # Another rank already won the lock and is/has saved.
-                return
-
-            gs = int(_handler_state["global_step"])
-            ep = int(_handler_state["epoch"])
-            ckpt_path = output_dir / f"checkpoint_interrupted_step{gs:06d}.pt"
-            save_checkpoint(
-                path=ckpt_path,
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                scaler=scaler if use_scaler else None,
-                model_ema=model_ema,
-                epoch=ep,
-                global_step=gs,
-                config=cfg,
-            )
-            _emergency_save_state["path"] = ckpt_path
-            _emergency_save_state["done"] = True
-            print(
-                f"\n[train] in-handler emergency checkpoint saved "
-                f"(rank={int(os.environ.get('RANK', '0'))}): {ckpt_path}",
-                flush=True,
-            )
-        except BaseException as exc:
-            try:
-                print(
-                    f"\n[train] in-handler emergency save FAILED: "
-                    f"{type(exc).__name__}: {exc}",
-                    flush=True,
-                )
-            except Exception:
-                pass
-        finally:
-            _emergency_save_state["in_progress"] = False
-
-    def _spawn_kill_backstop(delay_s: float) -> None:
-        """Spawn a detached child shell that ``kill -9``s us after ``delay_s``.
-
-        The child runs in its own process, completely independent of our
-        Python interpreter and GIL state. Even if every Python thread in
-        this rank is wedged inside a C extension call, the kernel will
-        deliver SIGKILL to us when the child runs ``kill -9``. SIGKILL
-        cannot be caught or ignored, so this is the bullet-proof
-        termination path.
-        """
-        import subprocess as _subp
-        pid = os.getpid()
-        # Use ``setsid`` so the child survives if the agent kills our
-        # process group; ``nohup`` plus ``</dev/null`` detaches from our
-        # tty. The shell sleeps then sends SIGKILL.
-        _subp.Popen(
-            ["sh", "-c", f"sleep {float(delay_s):.1f} && kill -9 {pid}"],
-            stdin=_subp.DEVNULL,
-            stdout=_subp.DEVNULL,
-            stderr=_subp.DEVNULL,
-            start_new_session=True,
-            close_fds=True,
-        )
-
-    def _start_force_exit_timer(delay_s: float) -> None:
-        """Arm/re-arm a daemon timer that ``os._exit``s after ``delay_s``.
-
-        Runs on a background thread so it is *independent* of whether the
-        main thread is wedged inside a C-level call (CUDA, NCCL, blocking
-        queue.get, etc.). This is what guarantees we actually exit.
-        """
-        existing = _force_exit_state["timer"]
-        if existing is not None:
-            try:
-                existing.cancel()
-            except Exception:
-                pass
-
-        def _force() -> None:
-            try:
-                try:
-                    print(
-                        f"\n[train] force-exit (rank={int(os.environ.get('RANK', '0'))})"
-                        f" after {delay_s:.1f}s grace period",
-                        flush=True,
-                    )
-                except Exception:
-                    pass
-            finally:
-                os._exit(0)
-
-        t = threading.Timer(delay_s, _force)
-        t.daemon = True
-        t.start()
-        _force_exit_state["timer"] = t
-
-    def _abort_distributed_for_emergency_save() -> None:
-        """Abort in-flight distributed work before checkpoint tensor copies."""
-        try:
-            if dist.is_available() and dist.is_initialized():
-                dist.destroy_process_group()
-        except BaseException:
-            pass
-
     def _sigint_handler(signum: int, frame: object) -> None:
+        del signum, frame
         nonlocal _interrupted
-        _sigint_count["n"] += 1
-        if _sigint_count["n"] == 1:
-            # First interrupt: arm OS-level kill backstop + Python timer,
-            # then attempt the lock-arbitrated emergency save. The
-            # watchdog thread also runs the same sequence (via the
-            # set_wakeup_fd pipe) so whichever path executes first wins.
-            try:
-                _spawn_kill_backstop(90.0)
-            except Exception:
-                pass
-            _start_force_exit_timer(60.0)
-            _abort_distributed_for_emergency_save()
-            _emergency_save_in_handler()
-        else:
-            # Second interrupt: shrink everything to ~1s and restore
-            # default handlers so a third signal hard-kills via the OS.
-            try:
-                _spawn_kill_backstop(2.0)
-            except Exception:
-                pass
-            _start_force_exit_timer(1.0)
-            for _sig in (signal.SIGINT, signal.SIGTERM):
-                try:
-                    signal.signal(_sig, signal.SIG_DFL)
-                except (ValueError, OSError):
-                    pass
-            if is_rank0():
-                print(
-                    "\n[train] second interrupt - grace period shortened, "
-                    "press Ctrl-C again to force-quit immediately.",
-                    flush=True,
-                )
         _interrupted = True
+        raise KeyboardInterrupt
 
     prev_sigint = signal.signal(signal.SIGINT, _sigint_handler)
-    # Also catch SIGTERM. torchrun's elastic agent reacts to a single Ctrl-C
-    # by raising SignalException in its own process and then calling
-    # MultiprocessingContext.close(), which sends SIGTERM to every worker.
     prev_sigterm = signal.signal(signal.SIGTERM, _sigint_handler)
-
-    # ------------------------------------------------------------------
-    # Out-of-thread signal watchdog.
-    #
-    # Python signal handlers run on the *main thread* between bytecodes.
-    # The runtime logs proved that under DDP, ranks whose main thread is
-    # parked inside a long C-level call (CUDA kernel-launch queue, NCCL
-    # collective, a DataLoader/queue.get auto-retried by PEP 475, ...)
-    # never get to run ``_sigint_handler`` at all - so neither the
-    # in-handler emergency save *nor* the ``threading.Timer`` force-exit
-    # is armed, and the worker only dies when torchrun's elastic agent
-    # escalates to SIGKILL ~30 s later.
-    #
-    # ``signal.set_wakeup_fd`` makes the OS-level signal trampoline
-    # write the signal number to a pipe *before* returning to user
-    # code. A background thread blocked on ``os.read`` from that pipe
-    # therefore wakes up the instant a signal is delivered, regardless
-    # of what the main thread is doing. From that thread we can arm
-    # the force-exit timer and attempt the lock-arbitrated save - both
-    # of which are idempotent with the in-handler path, so when the
-    # main thread *does* run ``_sigint_handler`` the duplicate calls
-    # are no-ops.
-    # ------------------------------------------------------------------
-    _signal_pipe_r, _signal_pipe_w = os.pipe()
-    try:
-        os.set_blocking(_signal_pipe_w, False)
-    except OSError:
-        pass
-    _prev_wakeup_fd = signal.set_wakeup_fd(_signal_pipe_w)
-
-    def _signal_watchdog() -> None:
-        try:
-            wake = os.read(_signal_pipe_r, 1)
-        except OSError:
-            return
-        # EOF means our wakeup pipe was closed during normal teardown,
-        # not that an actual signal was delivered.
-        if not wake:
-            return
-        signum = int(wake[0])
-        if signum not in {signal.SIGINT, signal.SIGTERM}:
-            return
-        # ----------------------------------------------------------------
-        # Spawn an OS-level SIGKILL backstop first. Python timers require
-        # the GIL to fire; if another thread on this rank is wedged inside
-        # a C extension, the ``threading.Timer`` force-exit can be starved.
-        # A detached child shell is immune to our GIL and ``kill -9`` cannot
-        # be caught.
-        # ----------------------------------------------------------------
-        try:
-            _spawn_kill_backstop(90.0)
-        except BaseException:
-            pass
-        # Arm the soft Python-level force-exit timer too (cheap belt-and-
-        # suspenders for the common case where the GIL is fine).
-        try:
-            _start_force_exit_timer(60.0)
-        except BaseException:
-            pass
-        # ----------------------------------------------------------------
-        # Per the PyTorch docs (Distributed Shutdown section),
-        # ``destroy_process_group()`` is what calls ``ncclCommAbort`` on
-        # the underlying communicator. Doing this before the save aborts
-        # any in-flight collective whose peers have abandoned us, which
-        # frees the CUDA stream that ``save_checkpoint``'s GPU->CPU copy
-        # would otherwise be queued behind.
-        # ----------------------------------------------------------------
-        _abort_distributed_for_emergency_save()
-        try:
-            _emergency_save_in_handler()
-        except BaseException:
-            pass
-        # Direct exit from the watchdog thread - we have nothing left to
-        # do and we don't want to depend on the Timer thread acquiring
-        # the GIL.
-        try:
-            print(
-                f"\n[train] watchdog exit (rank={int(os.environ.get('RANK', '0'))})"
-                f" save_done={_emergency_save_state['done']}",
-                flush=True,
-            )
-        except Exception:
-            pass
-        os._exit(0)
-
-    _watchdog_thread = threading.Thread(
-        target=_signal_watchdog,
-        name="signal-watchdog",
-        daemon=True,
-    )
-    _watchdog_thread.start()
 
     try:
         for epoch in range(start_epoch, epochs):
             if _interrupted or max_steps_reached:
                 break
 
-            _handler_state["epoch"] = epoch
-
             set_dataloader_epoch_safe(dataloader, epoch)
 
             model.train()
             optimizer.zero_grad(set_to_none=True)
 
-            running_loss = torch.zeros((), device=ddp.device, dtype=torch.float32)
-            pbar: tqdm | None = None
-            if is_rank0():
-                pbar = tqdm(
-                    total=len(dataloader),
-                    desc=f"Epoch {epoch + 1}/{epochs}",
-                    dynamic_ncols=True,
-                    leave=True,
-                )
+            running_loss = torch.zeros((), device=device, dtype=torch.float32)
+            pbar = tqdm(
+                total=len(dataloader),
+                desc=f"Epoch {epoch + 1}/{epochs}",
+                dynamic_ncols=True,
+                leave=True,
+            )
 
             prefetch_device_transform = device_transform if cuda_prefetch else None
 
             for it, batch in enumerate(
                 iterate_device_batches(
                     dataloader,
-                    ddp.device,
+                    device,
                     use_cuda_prefetch=cuda_prefetch,
                     prefetch_queue=cuda_prefetch_queue,
                     post_move_fn=prefetch_device_transform,
@@ -2307,13 +1697,6 @@ def train() -> None:
                 batch_loss_items: Dict[str, torch.Tensor] = {}
                 do_step = ((it + 1) % grad_accum_steps == 0) or (it + 1 == len(dataloader))
 
-                # All ranks run the same number of forward/backward passes so they
-                # finish compute at roughly the same time.  Padding chunks beyond
-                # the real count use zero weight (no gradient contribution).
-                # By default, sync DDP on each iteration's final chunk to avoid
-                # bursty all-reduce phases when grad_accum_steps > 1.
-                no_sync = model.no_sync if ddp.is_distributed else nullcontext
-
                 for chunk_idx, (start_t, end_t) in enumerate(temporal_chunks):
                     is_padding_chunk = chunk_idx >= real_n_chunks
                     with nvtx_range("slice_temporal_chunk"):
@@ -2334,52 +1717,45 @@ def train() -> None:
                                 (end_t - start_t) / max(1, int(batch["video_rgb"].shape[1]))
                             )
 
-                    if ddp_sync_every_iter:
-                        should_sync_ddp = chunk_idx == len(temporal_chunks) - 1
-                    else:
-                        should_sync_ddp = do_step and (chunk_idx == len(temporal_chunks) - 1)
-                    sync_context = nullcontext if (not ddp.is_distributed or should_sync_ddp) else no_sync
+                    offload_context = (
+                        torch.autograd.graph.save_on_cpu(pin_memory=activation_offload_pin_memory)
+                        if activation_offload_cpu
+                        else nullcontext()
+                    )
+                    with offload_context:
+                        with torch.amp.autocast(autocast_device, enabled=amp_enabled, dtype=amp_dtype):
+                            model_kwargs: Dict[str, Any] = {}
+                            if "global_video_rgb" in chunk_batch:
+                                model_kwargs["global_video"] = chunk_batch["global_video_rgb"]
+                            if "global_coarse_alpha_init" in chunk_batch:
+                                model_kwargs["global_coarse_alpha_init"] = chunk_batch["global_coarse_alpha_init"]
+                            if "global_fg_gt" in chunk_batch:
+                                model_kwargs["global_fg_guidance"] = chunk_batch["global_fg_gt"]
+                            if "tile_coords" in chunk_batch:
+                                model_kwargs["tile_coords"] = chunk_batch["tile_coords"]
+                            if "source_hw" in chunk_batch:
+                                model_kwargs["source_hw"] = chunk_batch["source_hw"]
 
-                    with sync_context():
-                        offload_context = (
-                            torch.autograd.graph.save_on_cpu(pin_memory=activation_offload_pin_memory)
-                            if activation_offload_cpu
-                            else nullcontext()
-                        )
-                        with offload_context:
-                            with torch.amp.autocast(autocast_device, enabled=amp_enabled, dtype=amp_dtype):
-                                model_kwargs: Dict[str, Any] = {}
-                                if "global_video_rgb" in chunk_batch:
-                                    model_kwargs["global_video"] = chunk_batch["global_video_rgb"]
-                                if "global_coarse_alpha_init" in chunk_batch:
-                                    model_kwargs["global_coarse_alpha_init"] = chunk_batch["global_coarse_alpha_init"]
-                                if "global_fg_gt" in chunk_batch:
-                                    model_kwargs["global_fg_guidance"] = chunk_batch["global_fg_gt"]
-                                if "tile_coords" in chunk_batch:
-                                    model_kwargs["tile_coords"] = chunk_batch["tile_coords"]
-                                if "source_hw" in chunk_batch:
-                                    model_kwargs["source_hw"] = chunk_batch["source_hw"]
+                            with nvtx_range("model_forward"):
+                                pred = model(
+                                    video=chunk_batch["video_rgb"],
+                                    coarse_alpha_init=chunk_batch["coarse_alpha_init"],
+                                    valid_mask=chunk_batch.get("valid_mask"),
+                                    bg_for_comp=chunk_batch["bg_gt"],
+                                    inference_options=train_inference_opts,
+                                    **model_kwargs,
+                                )
+                            with nvtx_range("loss_compute"):
+                                total_loss, loss_items = criterion(pred, chunk_batch)
+                                weighted_total_loss = total_loss * chunk_weight
+                                loss = weighted_total_loss / max(1, grad_accum_steps)
 
-                                with nvtx_range("model_forward"):
-                                    pred = model(
-                                        video=chunk_batch["video_rgb"],
-                                        coarse_alpha_init=chunk_batch["coarse_alpha_init"],
-                                        valid_mask=chunk_batch.get("valid_mask"),
-                                        bg_for_comp=chunk_batch["bg_gt"],
-                                        inference_options=train_inference_opts,
-                                        **model_kwargs,
-                                    )
-                                with nvtx_range("loss_compute"):
-                                    total_loss, loss_items = criterion(pred, chunk_batch)
-                                    weighted_total_loss = total_loss * chunk_weight
-                                    loss = weighted_total_loss / max(1, grad_accum_steps)
-
-                        with nvtx_range("backward"):
-                            if use_scaler:
-                                scaler.scale(loss).backward()
-                            else:
-                                loss.backward()
-                        did_backward = True
+                    with nvtx_range("backward"):
+                        if use_scaler:
+                            scaler.scale(loss).backward()
+                        else:
+                            loss.backward()
+                    did_backward = True
 
                     if not is_padding_chunk:
                         batch_total_loss = batch_total_loss + weighted_total_loss.detach()
@@ -2412,7 +1788,6 @@ def train() -> None:
                         optimizer.zero_grad(set_to_none=True)
                         scheduler.step()
                     global_step += 1
-                    _handler_state["global_step"] = global_step
                     if (
                         model_ema is not None
                         and optimizer_step_ran
@@ -2450,14 +1825,7 @@ def train() -> None:
                                 aliases=["latest", f"step-{global_step:06d}"],
                             )
 
-                        _save_checkpoint_with_filesystem_rendezvous(
-                            ddp=ddp,
-                            output_dir=output_dir,
-                            sync_session=filesystem_sync_session,
-                            sync_name=f"max_steps_step{global_step:06d}",
-                            timeout_seconds=checkpoint_sync_timeout_seconds,
-                            checkpoint_fn=_save_max_steps_checkpoint,
-                        )
+                        _save_max_steps_checkpoint()
                         max_steps_reached = True
                         break
                 elif do_step:
@@ -2472,34 +1840,14 @@ def train() -> None:
 
                 running_loss = running_loss + batch_total_loss.detach().to(dtype=torch.float32)
 
-                # IMPORTANT: any ``reduce_scalar`` call in this block is a
-                # collective and MUST be executed by every rank, not just
-                # rank 0. Previously the allreduces were nested inside
-                # ``if pbar is not None`` / ``if is_rank0()`` guards, which
-                # would deadlock the moment ``sync_log_metrics=true`` was
-                # set (rank 0 posts an allreduce nobody else does). Do the
-                # reduce first on all ranks, then fold the rank-0-only
-                # formatting and printing in afterwards.
                 pbar_needs_loss = show_loss_in_pbar and should_log
-                if pbar_needs_loss:
-                    loss_for_bar = batch_total_loss.detach()
-                    if sync_log_metrics and ddp.is_distributed:
-                        loss_for_bar = reduce_scalar(loss_for_bar, average=True)
-                else:
-                    loss_for_bar = None
+                loss_for_bar = batch_total_loss.detach() if pbar_needs_loss else None
 
                 reduced_items_t: Dict[str, torch.Tensor] | None = None
                 reduced_total_loss_t: torch.Tensor | None = None
                 if should_metric_log:
                     reduced_total_loss_t = batch_total_loss.detach()
-                    if sync_log_metrics and ddp.is_distributed:
-                        reduced_total_loss_t = reduce_scalar(reduced_total_loss_t, average=True)
-                    if sync_log_metrics and ddp.is_distributed:
-                        reduced_items_t = {
-                            k: reduce_scalar(v, average=True) for k, v in batch_loss_items.items()
-                        }
-                    elif is_rank0():
-                        reduced_items_t = {k: v for k, v in batch_loss_items.items()}
+                    reduced_items_t = {k: v for k, v in batch_loss_items.items()}
 
                 if pbar is not None:
                     pbar.update(1)
@@ -2509,7 +1857,7 @@ def train() -> None:
                     else:
                         pbar.set_postfix(lr=lr_str, step=global_step)
 
-                if should_metric_log and is_rank0() and reduced_items_t is not None:
+                if should_metric_log and reduced_items_t is not None:
                     reduced_items = {k: float(v.detach().to(device="cpu")) for k, v in reduced_items_t.items()}
                     reduced_total_loss = (
                         float(reduced_total_loss_t.detach().to(device="cpu"))
@@ -2548,15 +1896,15 @@ def train() -> None:
 
                 if args.profile and profile_total_steps > 0 and it + 1 >= profile_total_steps:
                     if prof is not None:
-                        if ddp.device.type == "cuda":
-                            torch.cuda.synchronize(ddp.device)
+                        if device.type == "cuda":
+                            torch.cuda.synchronize(device)
                         try:
                             prof.stop()
                         except RuntimeError as exc:
                             tqdm.write(f"Profiler stop warning: {exc}")
                         prof_stopped = True
 
-                        chrome_trace_path = profile_dir / f"chrome_trace_rank{ddp.rank}.json"
+                        chrome_trace_path = profile_dir / "chrome_trace.json"
                         chrome_trace_msg = str(chrome_trace_path)
                         try:
                             prof.export_chrome_trace(str(chrome_trace_path))
@@ -2579,14 +1927,6 @@ def train() -> None:
                             print(prof.key_averages().table(sort_by="self_cuda_memory_usage", row_limit=20))
                         else:
                             print("Profiler tables skipped. Use --profile-print-tables to include them.")
-                    # Rank 0 may spend seconds flushing profiler output. Keep
-                    # peers alive until the trace is on disk, then let every
-                    # rank leave the loop together and destroy DDP cleanly.
-                    if ddp.is_distributed:
-                        if ddp.device.type == "cuda" and dist.get_backend() == "nccl":
-                            dist.barrier(device_ids=[ddp.local_rank])
-                        else:
-                            dist.barrier()
                     profile_finished = True
                     break
 
@@ -2596,36 +1936,15 @@ def train() -> None:
             if profile_finished:
                 break
 
-            # NOTE: do NOT skip ``reduce_scalar`` on interrupt. It is the only
-            # rendezvous between the inner training loop and the cleanup path;
-            # if a subset of ranks bails out here while peers are still inside
-            # a backward()/NCCL collective, those peers can no longer complete
-            # their allreduce and the whole world hangs until the NCCL watchdog
-            # aborts it (~30s+). We only skip the *disk* checkpoint write on
-            # rank 0 below — the finally block writes an emergency checkpoint
-            # with the same state, so the regular per-epoch save is redundant
-            # on interrupt and was a multi-second stall that other ranks then
-            # waited out in cleanup.
             should_save_epoch_checkpoint = (
                 not max_steps_reached
                 and not _interrupted
                 and ((epoch + 1) % save_interval == 0 or (epoch + 1) == epochs)
             )
 
-            # Save before the epoch-loss allreduce. In DDP, rank 0 has
-            # completed the same optimizer steps as its peers once it exits
-            # the inner loop, but peers can still be draining DataLoader /
-            # CUDA-prefetch work. The checkpoint helper uses marker files
-            # instead of a NCCL barrier so long disk writes do not trip the
-            # watchdog while peers wait.
             if max_steps_reached:
                 pass  # Final checkpoint already saved at the max_steps cap.
             elif _interrupted:
-                # Skip the regular per-epoch disk write on interrupt: the
-                # ``finally`` block writes an emergency checkpoint with the
-                # exact same state, and the back-to-back saves were a
-                # multi-second shutdown stall that other ranks waited out
-                # inside ``cleanup_distributed``.
                 pass
             elif should_save_epoch_checkpoint:
                 ckpt_path = output_dir / f"checkpoint_epoch_{epoch:03d}.pt"
@@ -2651,25 +1970,15 @@ def train() -> None:
                         aliases=["latest", f"epoch-{epoch:03d}", f"step-{global_step:06d}"],
                     )
 
-                _save_checkpoint_with_filesystem_rendezvous(
-                    ddp=ddp,
-                    output_dir=output_dir,
-                    sync_session=filesystem_sync_session,
-                    sync_name=f"epoch{epoch:03d}_step{global_step:06d}",
-                    timeout_seconds=checkpoint_sync_timeout_seconds,
-                    checkpoint_fn=_save_epoch_checkpoint,
-                )
+                _save_epoch_checkpoint()
 
             epoch_loss = running_loss / max(1, len(dataloader))
-            if ddp.is_distributed:
-                epoch_loss = reduce_scalar(epoch_loss, average=True)
-            if is_rank0():
-                epoch_loss_value = float(epoch_loss.detach().to(device="cpu"))
-                tqdm.write(f"[epoch {epoch:03d}] avg_total_loss={epoch_loss_value:.6f}")
-                wandb_logger.log(
-                    {"epoch/avg_total_loss": epoch_loss_value, "epoch": int(epoch)},
-                    step=global_step,
-                )
+            epoch_loss_value = float(epoch_loss.detach().to(device="cpu"))
+            tqdm.write(f"[epoch {epoch:03d}] avg_total_loss={epoch_loss_value:.6f}")
+            wandb_logger.log(
+                {"epoch/avg_total_loss": epoch_loss_value, "epoch": int(epoch)},
+                step=global_step,
+            )
 
     except KeyboardInterrupt:
         _interrupted = True
@@ -2682,15 +1991,6 @@ def train() -> None:
             signal.signal(signal.SIGTERM, prev_sigterm)
         except (ValueError, OSError):
             pass
-        try:
-            signal.set_wakeup_fd(_prev_wakeup_fd)
-        except (ValueError, OSError):
-            pass
-        for _fd in (_signal_pipe_w, _signal_pipe_r):
-            try:
-                os.close(_fd)
-            except OSError:
-                pass
 
         if prof is not None:
             if not prof_stopped:
@@ -2699,11 +1999,8 @@ def train() -> None:
                 except RuntimeError:
                     pass
 
-        if _interrupted and is_rank0() and not _emergency_save_state["done"]:
-            # Fallback: the in-handler save did not run on this rank (e.g.
-            # we got here via KeyboardInterrupt without our handler firing,
-            # or another rank's handler also missed). Best-effort save.
-            print("\n\nInterrupted — saving emergency checkpoint (finally fallback)...")
+        if _interrupted:
+            print("\n\nInterrupted - saving emergency checkpoint...")
             ckpt_path = output_dir / f"checkpoint_interrupted_step{global_step:06d}.pt"
             try:
                 save_checkpoint(
@@ -2721,13 +2018,12 @@ def train() -> None:
             except Exception as exc:
                 print(f"Failed to save emergency checkpoint: {exc}")
 
-        if profile_finished and is_rank0():
+        if profile_finished:
             tqdm.write("Profile capture completed.")
-        elif not _interrupted and is_rank0():
+        elif not _interrupted:
             tqdm.write("Training completed.")
 
         wandb_logger.finish()
-        cleanup_distributed()
 
 
 if __name__ == "__main__":

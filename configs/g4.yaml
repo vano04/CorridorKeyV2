@@ -1,4 +1,4 @@
-# V3 multi-GPU/high-end workstation config (e.g. RTX 6000 Ada 96GB)
+# V3 single-GPU/high-end workstation config (e.g. RTX 6000 Ada 96GB)
 # Scaled for 96GB VRAM, ~300GB RAM, and high core-count CPUs.
 #
 # Derived from v3_single_5090_fp8_alt_1024.yaml with tweaks for:
@@ -64,15 +64,17 @@ model:
     fp8_recipe: delayed_scaling
 
 data:
+  dataset: local
   root_dir: "CorridorKeyDataset"
   multi_resolution_buckets: [384, 512]
-  batch_size_per_gpu: 2            # Increased for 96GB VRAM
+  batch_size: 2                    # Increased for 96GB VRAM
   clip_len_min: 16                 # Increased for better temporal context
   clip_len_max: 16                 # Increased for better temporal context
   fixed_crop_size: 512
   fg_representation: premul
   device_augment: true
-  host_dtype: bf16
+  host_dtype: fp16
+  read_dtype: fp16
   num_torch_threads: 4             # Scaled for 48-thread CPU
   horizontal_flip_p: 0.5
   background_replace_p: 0.3
@@ -168,8 +170,3 @@ loss:
   native_alpha_delta_reg: 0.10
   native_fg_delta_reg: 0.10
   quality_eval: 0.1
-
-ddp:
-  backend: nccl
-  find_unused_parameters: false
-  timeout_minutes: 30

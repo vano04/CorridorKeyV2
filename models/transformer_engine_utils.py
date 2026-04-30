@@ -3,7 +3,7 @@
 Provides config-controlled wrappers that use NVIDIA Transformer Engine modules
 when available and enabled, falling back to standard PyTorch modules otherwise.
 
-FP8 is for single-card RTX 5090 path only; DDP configs must use bf16.
+FP8 is intended for the single-card RTX 5090 path.
 """
 from __future__ import annotations
 

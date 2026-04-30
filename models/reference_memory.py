@@ -104,7 +104,7 @@ class ReferenceMemoryBank(nn.Module):
         self.null_token = nn.Parameter(torch.randn(1, tokens_per_reference, dim) * 0.02)
 
     def _select_reference_indices(self, t: int) -> list[int]:
-        """Select a fixed-size deterministic reference set for compile/DDP stability."""
+        """Select a fixed-size deterministic reference set for compiled graphs."""
         if t <= 0 or self.num_reference_frames <= 0:
             return []
 
@@ -161,7 +161,7 @@ class ReferenceMemoryBank(nn.Module):
 
         result = torch.cat(all_tokens, dim=1)
         # Always add null_token as a tiny differentiable bias so the parameter
-        # is in the computation graph every iteration (DDP static_graph).
+        # is in the computation graph every iteration.
         result = result + self.null_token.expand(b, -1, -1).mean() * 0.0
         return result
 

@@ -23,7 +23,7 @@ if _PROJECT_ROOT not in sys.path:
 from CorridorKeyDataset.dataset import (  # noqa: E402
     DEFAULT_MODALITIES,
     CorridorKeyWebSequenceDataset,
-    create_ddp_dataloader,
+    create_single_gpu_dataloader,
 )
 from Infer.inference import (  # noqa: E402
     _checkpoint_state_dict,
@@ -241,7 +241,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         transform=transform,
         convert_to_float=bool(data_cfg.get("dataset_convert_to_float", True)),
         shard_glob=str(data_cfg.get("shard_glob", "*.tar")),
-        manifest_filename=str(data_cfg.get("manifest_filename", "clips_manifest.jsonl")),
+        manifest_filename=str(data_cfg.get("manifest_filename", "manifest.json")),
         exr_decode_threads=max(1, int(data_cfg.get("exr_decode_threads", 1))),
         split=str(args.split),
         validation_shard_indices=validation_shards,
@@ -258,7 +258,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     collate_fn = lambda batch: pad_collate_video(batch, pad_multiple=int(cfg.get("model", {}).get("patch_size", 8)))
     num_workers = args.num_workers if args.num_workers is not None else int(data_cfg.get("num_workers", 4))
-    dataloader = create_ddp_dataloader(
+    dataloader = create_single_gpu_dataloader(
         dataset=dataset,
         batch_size=max(1, int(args.batch_size)),
         num_workers=max(0, int(num_workers)),
@@ -268,8 +268,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         persistent_workers=bool(data_cfg.get("persistent_workers", True)),
         prefetch_factor=int(data_cfg.get("prefetch_factor", 2)),
         seed=int(data_cfg.get("seed", 1337)),
-        rank=0,
-        world_size=1,
         collate_fn=collate_fn,
         num_torch_threads=int(data_cfg.get("num_torch_threads", 1)),
         exr_internal_threads=int(data_cfg.get("exr_internal_threads", 0)),

@@ -1,13 +1,21 @@
-"""V3 DDP static graph test.
+"""V3 static graph regression tests.
 
 Verifies that all model parameters receive gradients every forward pass,
 even when refine_mask is all zeros (no refinement needed).
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 import pytest
 import torch
 from torch import Tensor
+
+_PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
+if _PROJECT_ROOT in sys.path:
+    sys.path.remove(_PROJECT_ROOT)
+sys.path.insert(0, _PROJECT_ROOT)
 
 from models import build_v3_hybrid_video_matting_model
 from models.native_detail_refiner import NativeDetailRefiner
@@ -64,7 +72,7 @@ def test_all_params_get_gradients(model):
         if p.requires_grad and p.grad is None:
             no_grad_params.append(name)
 
-    assert len(no_grad_params) == 0, f"Parameters without gradients (would break DDP static_graph): {no_grad_params}"
+    assert len(no_grad_params) == 0, f"Parameters without gradients: {no_grad_params}"
 
 
 def test_same_output_keys_with_zero_refine_mask(model):

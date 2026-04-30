@@ -7,7 +7,7 @@ import argparse
 import importlib
 # ... just import the main module
 try:
-    import training_web
+    import training
 except Exception as e:
     import traceback
     traceback.print_exc()

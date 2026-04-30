@@ -7,7 +7,7 @@ from typing import Any, Dict, Optional
 
 
 class WandbLogger:
-    """Thin wrapper that keeps wandb optional and rank-local."""
+    """Thin wrapper that keeps wandb optional and process-local."""
 
     def __init__(self, run: Any = None, *, log_checkpoints: bool = False) -> None:
         self.run = run
@@ -53,15 +53,15 @@ def init_wandb_logger(
     cfg: Dict[str, Any],
     *,
     output_dir: Path,
-    rank0: bool,
+    enabled_for_process: bool,
     model: Any = None,
     debug_console: bool = False,
 ) -> WandbLogger:
-    """Create a rank-0 wandb run from ``train.wandb`` config when enabled."""
+    """Create a wandb run from ``train.wandb`` config when enabled."""
     train_cfg = cfg.get("train", {})
     wandb_cfg = dict(train_cfg.get("wandb", {}) or {})
     enabled = bool(wandb_cfg.get("enabled", False))
-    if not enabled or not rank0:
+    if not enabled or not enabled_for_process:
         return WandbLogger()
 
     try:
