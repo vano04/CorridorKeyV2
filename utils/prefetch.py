@@ -48,6 +48,15 @@ class AsyncDevicePrefetcher:
         self._stop = threading.Event()
         self._thread = None
 
+    def _put_until_stopped(self, item: Any) -> bool:
+        while not self._stop.is_set():
+            try:
+                self._queue.put(item, timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
+
     def _produce(self) -> None:
         try:
             count = 0
@@ -76,11 +85,9 @@ class AsyncDevicePrefetcher:
                     except queue.Full: continue
                 count += 1
         except Exception as exc:
-            try: self._queue.put(exc, timeout=1.0)
-            except queue.Full: pass
+            self._put_until_stopped(exc)
         finally:
-            try: self._queue.put(_SENTINEL, timeout=1.0)
-            except queue.Full: pass
+            self._put_until_stopped(_SENTINEL)
 
     def __iter__(self) -> Iterator[Dict[str, Any]]:
         self._stop.clear()
@@ -88,7 +95,12 @@ class AsyncDevicePrefetcher:
         self._thread.start()
         try:
             while True:
-                item = self._queue.get()
+                try:
+                    item = self._queue.get(timeout=0.1)
+                except queue.Empty:
+                    if self._thread is not None and not self._thread.is_alive():
+                        break
+                    continue
                 if item is _SENTINEL: break
                 if isinstance(item, Exception): raise item
                 gpu_batch, event = item

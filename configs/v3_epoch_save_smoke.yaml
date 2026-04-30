@@ -1,0 +1,118 @@
+# Tiny one-batch epoch-save smoke. Exercises the end-of-epoch checkpoint path
+# without using train.max_steps, which intentionally saves a step checkpoint.
+
+model:
+  patch_size: 8
+  embed_dims: [64, 128, 192, 256]
+  depths: [1, 1, 2, 1]
+  num_heads: [2, 4, 6, 8]
+  window_sizes: [8, 8, 4, 4]
+  memory_tokens: 16
+  temporal_window: 3
+  drop_path_rate: 0.0
+  gradient_checkpointing: false
+  decoder_out_dim: 128
+  use_green_priors: true
+  use_coordinate_channels: true
+  use_unknown_band: true
+  guidance_presence_flag: true
+  green_prior_dropout: 0.0
+  coarse_alpha_drop_prob: 0.0
+  predict_fg: true
+  predict_uncertainty: true
+  predict_spill_mask: true
+  predict_quality_eval: true
+  fg_representation: premul
+  global_context_dim: 128
+  global_context_layers: 2
+  global_context_heads: 4
+  global_context_tokens: 16
+  use_reference_memory: true
+  reference_tokens_per_frame: 16
+  num_reference_frames: 1
+  reference_dropout: 0.0
+  use_native_refiner: true
+  native_refiner_blocks: 2
+  native_refiner_hidden: 32
+  native_refiner_max_alpha_delta: 0.25
+  native_refiner_max_fg_delta: 0.15
+  native_refiner_max_spill_delta: 0.10
+
+data:
+  dataset: local
+  dataset_root: "CorridorKeyDataset"
+  batch_size: 1
+  clip_len_min: 2
+  clip_len_max: 4
+  fixed_crop_size: 256
+  fg_representation: premul
+  device_augment: true
+  decode_full_frame: true
+  emit_global_context: true
+  global_context_long_side: 256
+  host_dtype: fp16
+  read_dtype: fp16
+  num_workers: 2
+  pin_memory: true
+  horizontal_flip_p: 0.0
+  background_replace_p: 0.0
+  spill_augment_p: 0.0
+  green_foreground_prob: 0.0
+  green_foreground_strength_min: 0.25
+  green_foreground_strength_max: 0.75
+  green_foreground_alpha_thresh: 0.70
+  coarse_alpha_drop_prob: 0.0
+  hint_degrade_enabled: true
+  hint_degrade_clean_prob: 1.0
+  hint_degrade_mild_prob: 0.0
+
+train:
+  epochs: 1
+  max_epoch_batches: 1
+  lr: 1.0e-4
+  weight_decay: 0.01
+  warmup_steps: 2
+  amp: true
+  amp_dtype: bf16
+  grad_clip: 1.0
+  compile: false
+  cuda_warmup: false
+  cuda_prefetch: true
+  cuda_prefetch_queue: 1
+  log_interval: 1
+  save_interval: 1
+  inference_mode: hybrid
+  temporal_batch_size: 4
+  debug_console: true
+  wandb:
+    enabled: false
+    entity: vanoinc
+    project: CorridorKeyV2
+
+loss:
+  alpha_l1: 1.0
+  alpha_laplacian: 1.0
+  fg_l1: 1.0
+  comp_l1: 1.0
+  alpha_band_l1: 0.5
+  alpha_band_laplacian: 0.5
+  temporal_alpha_gradient: 0.3
+  temporal_fg_gradient: 0.15
+  comp_random_bg: 0.3
+  spill_l1: 0.5
+  spill_transition_only: true
+  spill_transition_low: 0.02
+  spill_transition_high: 0.98
+  spill_exclude_opaque_fg: true
+  spill_opaque_alpha_thresh: 0.90
+  green_fg_alpha: 1.0
+  green_fg_color: 0.5
+  green_fg_alpha_thresh: 0.75
+  green_fg_margin: 0.08
+  green_fg_min_saturation: 0.10
+  uncertainty: 0.1
+  coarse_alpha_l1: 0.5
+  coarse_fg_l1: 0.3
+  native_alpha_delta_reg: 0.05
+  native_fg_delta_reg: 0.05
+  quality_eval: 0.1

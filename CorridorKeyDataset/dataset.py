@@ -571,6 +571,7 @@ class CorridorKeyWebSequenceDataset(Dataset):
         source_hw: Optional[Sequence[int]] = None,
         emit_tile_metadata: bool = True,
         decode_global_context: bool = False,
+        cached_four_quadrant_batch: bool = False,
         global_context_root_dir: Path | str | None = None,
         global_context_long_side: int = 0,
         global_context_modalities: Sequence[str] = ("FG", "Alpha"),
@@ -605,6 +606,7 @@ class CorridorKeyWebSequenceDataset(Dataset):
         self.source_hw = _coerce_source_hw(source_hw)
         self.emit_tile_metadata = bool(emit_tile_metadata)
         self.decode_global_context = bool(decode_global_context)
+        self.cached_four_quadrant_batch = bool(cached_four_quadrant_batch)
         self.global_context_long_side = int(global_context_long_side)
         self.global_context_modalities = _normalise_global_modalities(global_context_modalities)
         self.dtype = _resolve_torch_dtype(read_dtype if read_dtype is not None else dtype)
@@ -952,7 +954,7 @@ class CorridorKeyWebSequenceDataset(Dataset):
             out[out_name] = torch.stack([frame for frame in frames if frame is not None], dim=0)
         return out
 
-    def __getitem__(self, index: int) -> Dict[str, object]:
+    def _sample_frame_numbers_for_index(self, index: int) -> Tuple[WebClipIndex, List[int]]:
         clip_idx, start = self.samples[index]
         clip = self.clips[clip_idx]
         all_positions = [start + (i * self.frame_stride) for i in range(self.sequence_length)]
@@ -965,7 +967,138 @@ class CorridorKeyWebSequenceDataset(Dataset):
             positions = all_positions[sub_start : sub_start + clip_len]
         else:
             positions = all_positions
-        frame_numbers = [clip.frame_numbers[pos] for pos in positions]
+        return clip, [clip.frame_numbers[pos] for pos in positions]
+
+    def _four_quadrant_tile_grids(self) -> Tuple[Tuple[int, int, int, int], ...]:
+        source_h, source_w = self.source_hw
+        tile = max(1, int(self.exr_tile_size))
+        span = max(1, int(self.local_tile_span))
+        if self.decode_full_frame or source_h != source_w or source_h != tile * span * 2:
+            raise ValueError(
+                "cached_four_quadrant_batch expects a square 2x2 quadrant layout with "
+                "source_hw == [2 * exr_tile_size * local_tile_span] on both axes. "
+                f"Got source_hw={self.source_hw}, exr_tile_size={tile}, local_tile_span={span}."
+            )
+        return (
+            (0, span - 1, 0, span - 1),
+            (span, (span * 2) - 1, 0, span - 1),
+            (0, span - 1, span, (span * 2) - 1),
+            (span, (span * 2) - 1, span, (span * 2) - 1),
+        )
+
+    def _load_cached_quadrant_tensor(
+        self,
+        clip: WebClipIndex,
+        field: str,
+        frame_number: int,
+        tile_grid: Tuple[int, int, int, int],
+    ) -> Tensor:
+        return _load_member_tensor(
+            clip.shard_path,
+            self._resolve_member(clip, field, frame_number),
+            modality=field,
+            dtype=self.dtype,
+            tile_grid=tile_grid,
+            source_hw=self.source_hw,
+            tile_size=self.exr_tile_size,
+        )
+
+    def _assemble_cached_full_frame(
+        self,
+        quadrant_tensors: Sequence[Tensor],
+        grids: Sequence[Tuple[int, int, int, int]],
+    ) -> Tensor:
+        source_h, source_w = self.source_hw
+        tile = max(1, int(self.exr_tile_size))
+        canvas = torch.empty((int(quadrant_tensors[0].shape[0]), source_h, source_w), dtype=self.dtype)
+        for tensor, grid in zip(quadrant_tensors, grids):
+            tx0, tx1, ty0, ty1 = grid
+            del tx1, ty1
+            y0 = ty0 * tile
+            x0 = tx0 * tile
+            y1 = min(source_h, y0 + int(tensor.shape[-2]))
+            x1 = min(source_w, x0 + int(tensor.shape[-1]))
+            canvas[:, y0:y1, x0:x1] = tensor[:, : y1 - y0, : x1 - x0]
+        return canvas
+
+    def _downscale_cached_global_frame(self, frame_chw: Tensor) -> Tensor:
+        source_long = max(self.source_hw)
+        target_long = int(self.global_context_long_side)
+        if target_long > 0 and source_long == target_long * 2:
+            return _downscale_2x_box_chw(frame_chw)
+        raise ValueError(
+            "cached_four_quadrant_batch currently expects global_context_long_side to be "
+            f"half the source long side. Got source_hw={self.source_hw}, "
+            f"global_context_long_side={self.global_context_long_side}."
+        )
+
+    def _getitem_cached_four_quadrants(self, index: int) -> Dict[str, object]:
+        clip, frame_numbers = self._sample_frame_numbers_for_index(index)
+        grids = self._four_quadrant_tile_grids()
+        local_fields_by_name = {
+            out_name: field
+            for out_name, field in zip(self.modalities, self.modality_fields)
+        }
+        global_fields = tuple(_normalise_modality_name(m) for m in self.global_context_modalities)
+        needed_fields = tuple(dict.fromkeys([*self.modality_fields, *global_fields]))
+
+        tasks: List[Tuple[str, int, int, Tuple[int, int, int, int]]] = []
+        for frame_number in frame_numbers:
+            for grid_idx, grid in enumerate(grids):
+                for field in needed_fields:
+                    tasks.append((field, int(frame_number), grid_idx, grid))
+
+        def decode(task: Tuple[str, int, int, Tuple[int, int, int, int]]) -> Tuple[Tuple[str, int, int], Tensor]:
+            field, frame_number, grid_idx, grid = task
+            return (field, frame_number, grid_idx), self._load_cached_quadrant_tensor(clip, field, frame_number, grid)
+
+        pool = self._get_decode_pool()
+        decoded = [decode(task) for task in tasks] if pool is None else list(pool.map(decode, tasks))
+        cache: Dict[Tuple[str, int, int], Tensor] = dict(decoded)
+
+        global_tensors: Dict[str, Tensor] = {}
+        if self.decode_global_context:
+            for modality in self.global_context_modalities:
+                field = _normalise_modality_name(modality)
+                frames = []
+                for frame_number in frame_numbers:
+                    quadrants = [cache[(field, int(frame_number), grid_idx)] for grid_idx in range(len(grids))]
+                    full = self._assemble_cached_full_frame(quadrants, grids)
+                    frames.append(self._downscale_cached_global_frame(full))
+                global_tensors[_global_key(modality)] = torch.stack(frames, dim=0)
+
+        source_h, source_w = self.source_hw
+        tile = max(1, int(self.exr_tile_size))
+        prebatched: List[Dict[str, object]] = []
+        for grid_idx, grid in enumerate(grids):
+            tx0, tx1, ty0, ty1 = grid
+            y0 = ty0 * tile
+            x0 = tx0 * tile
+            y1 = min(source_h, (ty1 + 1) * tile)
+            x1 = min(source_w, (tx1 + 1) * tile)
+            sample: Dict[str, object] = {
+                "clip_name": clip.name,
+                "frame_numbers": torch.tensor(frame_numbers, dtype=torch.long),
+            }
+            if self.emit_tile_metadata:
+                sample["tile_coords"] = torch.tensor([float(y0), float(y1), float(x0), float(x1)], dtype=torch.float32)
+                sample["source_hw"] = torch.tensor([float(source_h), float(source_w)], dtype=torch.float32)
+                sample["tile_grid"] = torch.tensor([tx0, tx1, ty0, ty1], dtype=torch.long)
+            for out_name, field in local_fields_by_name.items():
+                sample[out_name] = torch.stack(
+                    [cache[(field, int(frame_number), grid_idx)] for frame_number in frame_numbers],
+                    dim=0,
+                )
+            sample.update(global_tensors)
+            if self.transform is not None:
+                sample = self.transform(sample)
+            prebatched.append(sample)
+        return {"_prebatched_samples": prebatched}
+
+    def __getitem__(self, index: int) -> Dict[str, object]:
+        if self.cached_four_quadrant_batch:
+            return self._getitem_cached_four_quadrants(index)
+        clip, frame_numbers = self._sample_frame_numbers_for_index(index)
         tile_grid, tile_coords, source_hw, tile_grid_t = _sample_tile_selection(
             decode_full_frame=self.decode_full_frame,
             source_hw=self.source_hw,

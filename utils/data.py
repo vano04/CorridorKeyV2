@@ -841,6 +841,20 @@ def pad_collate_video(batch: List[Dict[str, object]], pad_multiple: int = 8) -> 
       and skip allocating the absent keys. The training loop then runs
       ``DeviceMattingTransform`` after H2D, which fills them in.
     """
+    flattened_batch: List[Dict[str, object]] = []
+    saw_prebatched = False
+    for item in batch:
+        prebatched = item.get("_prebatched_samples") if isinstance(item, dict) else None
+        if isinstance(prebatched, list):
+            saw_prebatched = True
+            flattened_batch.extend([sample for sample in prebatched if isinstance(sample, dict)])
+        else:
+            flattened_batch.append(item)
+    if saw_prebatched:
+        batch = flattened_batch
+        if not batch:
+            raise ValueError("Received an empty prebatched sample list")
+
     b = len(batch)
     # Pick whichever of the standard tensors is present to size the batch
     # buffers. ``video_rgb`` is the host-mode anchor; ``fg_gt`` is the

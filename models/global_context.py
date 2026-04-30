@@ -93,7 +93,25 @@ class GlobalTemporalAttention(nn.Module):
         qkv = self.qkv(x_seq).reshape(b * s, t, 3, self.num_heads, self.head_dim)
         qkv = qkv.permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
-        out = F.scaled_dot_product_attention(q, k, v)
+        # Some SDPA CUDA backends reject very large effective batch counts.
+        # At 1024px global context with patch_size=8, B=4 gives
+        # B*H*W == 65,536 temporal sequences; chunking keeps the same math
+        # while staying below backend launch limits.
+        max_sdpa_batch = 32768
+        if q.shape[0] > max_sdpa_batch and q.is_cuda:
+            out = torch.cat(
+                [
+                    F.scaled_dot_product_attention(
+                        q[start : start + max_sdpa_batch],
+                        k[start : start + max_sdpa_batch],
+                        v[start : start + max_sdpa_batch],
+                    )
+                    for start in range(0, q.shape[0], max_sdpa_batch)
+                ],
+                dim=0,
+            )
+        else:
+            out = F.scaled_dot_product_attention(q, k, v)
         out = out.transpose(1, 2).reshape(b * s, t, c)
         out = self.proj(out)
         return out.reshape(b, h, w, t, c).permute(0, 3, 1, 2, 4)

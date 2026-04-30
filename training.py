@@ -1128,6 +1128,7 @@ def build_dataloader(config: Dict[str, Any]) -> DataLoader:
         "source_hw": data_cfg.get("source_hw", [2048, 2048]),
         "emit_tile_metadata": bool(data_cfg.get("emit_tile_metadata", True)),
         "decode_global_context": bool(data_cfg.get("decode_global_context", False)),
+        "cached_four_quadrant_batch": bool(data_cfg.get("cached_four_quadrant_batch", False)),
         "global_context_root_dir": data_cfg.get("global_context_root_dir"),
         "global_context_long_side": int(data_cfg.get("global_context_long_side", 0)),
         "global_context_modalities": data_cfg.get("global_context_modalities", ["Input", "Alpha"]),
@@ -1356,6 +1357,7 @@ def train() -> None:
     # we want a real save artefact without grinding through a whole epoch.
     max_steps_cfg = train_cfg.get("max_steps", None)
     max_steps = int(max_steps_cfg) if max_steps_cfg is not None else 0
+    max_epoch_batches = max(0, int(train_cfg.get("max_epoch_batches", 0)))
 
     # The LR schedule's "total_steps" should reflect how many optimizer
     # updates we ACTUALLY plan to take, i.e. ``min(epochs*epoch_steps,
@@ -1386,6 +1388,11 @@ def train() -> None:
         f"Step accounting: dataloader_iters_per_epoch={len(dataloader)}, "
         f"grad_accum_steps={grad_accum_steps}, optimizer_steps_per_epoch={epoch_steps}",
     )
+    if max_epoch_batches > 0:
+        _maybe_print(
+            debug_console_enabled,
+            f"Epoch batch cap enabled: max_epoch_batches={max_epoch_batches}",
+        )
 
     amp_enabled = bool(train_cfg.get("amp", True)) and device.type == "cuda"
     amp_dtype_name = str(train_cfg.get("amp_dtype", "fp16")).lower()
@@ -1928,6 +1935,13 @@ def train() -> None:
                         else:
                             print("Profiler tables skipped. Use --profile-print-tables to include them.")
                     profile_finished = True
+                    break
+
+                if max_epoch_batches > 0 and it + 1 >= max_epoch_batches:
+                    tqdm.write(
+                        f"Reached max_epoch_batches={max_epoch_batches} at epoch iter={it + 1}; "
+                        "ending epoch early."
+                    )
                     break
 
             if pbar is not None:

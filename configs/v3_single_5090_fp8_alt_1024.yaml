@@ -47,7 +47,7 @@ model:
   use_native_refiner: true
   native_refiner_blocks: 2
   native_refiner_hidden: 48
-  native_refiner_chunk_frames: 8
+  native_refiner_chunk_frames: 1
   native_refiner_max_alpha_delta: 0.03
   native_refiner_max_fg_delta: 0.02
   native_refiner_max_spill_delta: 0.15
@@ -65,8 +65,9 @@ model:
 data:
   dataset: local
   root_dir: "CorridorKeyDataset"
+  modalities: [FG, BG, Alpha]
   multi_resolution_buckets: [384, 512]
-  batch_size: 1
+  batch_size: 2
   clip_len_min: 8
   clip_len_max: 8
   fixed_crop_size: 512
@@ -76,6 +77,7 @@ data:
   read_dtype: fp16
   num_torch_threads: 1
   horizontal_flip_p: 0.5
+  temporal_jitter_p: 0.0
   background_replace_p: 0.3
   spill_augment_p: 0.4
   green_foreground_prob: 0.0
@@ -92,12 +94,13 @@ data:
   local_tile_span: 4
   source_hw: [2048, 2048]
   exr_internal_threads: 0
-  exr_decode_threads: 3
+  exr_decode_threads: 4
   emit_tile_metadata: true
-  decode_global_context: false
+  decode_global_context: true
+  cached_four_quadrant_batch: true
   global_context_modalities: [Input, Alpha, FG]
-  num_workers: 6
-  prefetch_factor: 3
+  num_workers: 4
+  prefetch_factor: 1
   persistent_workers: true
   pin_memory: true
 train:
@@ -113,7 +116,7 @@ train:
   log_interval: 20
   save_interval: 1
   inference_mode: hybrid
-  temporal_batch_size: 8
+  temporal_batch_size: 4
   debug_console: true
   grad_accum_steps: 1
   rematerialize_activations: true
@@ -128,7 +131,7 @@ train:
   compile_dynamic: true
   cuda_warmup: false
   cuda_prefetch: true
-  cuda_prefetch_queue: 3
+  cuda_prefetch_queue: 2
   wandb:
     enabled: true
     entity: vanoinc
