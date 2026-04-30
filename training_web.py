@@ -105,7 +105,9 @@ from utils import (
     pad_collate_video,
 )
 from utils.ddp import is_rank0, reduce_scalar
+from utils.ema import ModelEma
 from utils.nvtx_utils import nvtx_range
+from utils.wandb_logging import init_wandb_logger
 
 
 def parse_args() -> argparse.Namespace:
@@ -684,6 +686,7 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     scheduler: LambdaLR,
     scaler: torch.amp.GradScaler | None,
+    model_ema: ModelEma | None,
     epoch: int,
     global_step: int,
     config: Dict[str, Any],
@@ -709,6 +712,9 @@ def save_checkpoint(
 
     if scaler is not None:
         ckpt["scaler"] = _checkpoint_value_to_cpu(scaler.state_dict())
+    if model_ema is not None:
+        ckpt["model_ema"] = _checkpoint_value_to_cpu(model_ema.state_dict())
+        ckpt["model_ema_state_dict"] = _checkpoint_value_to_cpu(model_ema.model_state_dict())
 
     _atomic_torch_save(ckpt, path)
 
@@ -840,6 +846,7 @@ def load_checkpoint(
     optimizer: torch.optim.Optimizer,
     scheduler: LambdaLR,
     scaler: torch.amp.GradScaler | None,
+    model_ema: ModelEma | None,
     device: torch.device,
 ) -> Tuple[int, int]:
     ckpt = torch.load(_resolve_checkpoint_path(path), map_location=device)
@@ -854,6 +861,12 @@ def load_checkpoint(
         scheduler.load_state_dict(ckpt["scheduler"])
     if scaler is not None and "scaler" in ckpt:
         scaler.load_state_dict(ckpt["scaler"])
+    if model_ema is not None:
+        ema_state = ckpt.get("model_ema", ckpt.get("model_ema_state_dict"))
+        if ema_state is not None:
+            model_ema.load_state_dict(ema_state)
+        else:
+            model_ema.reset(model)
 
     start_epoch = int(ckpt.get("epoch", -1)) + 1
     global_step = int(ckpt.get("global_step", 0))
@@ -1238,6 +1251,12 @@ def build_dataloader(config: Dict[str, Any], rank: int, world_size: int) -> Data
         "global_context_root_dir": data_cfg.get("global_context_root_dir"),
         "global_context_long_side": int(data_cfg.get("global_context_long_side", 0)),
         "global_context_modalities": data_cfg.get("global_context_modalities", ["Input", "Alpha"]),
+        "webdataset_repo_id": str(data_cfg.get("webdataset_repo_id", "Vano04/CorridorKeyDataset_Custom")),
+        "web_shard_cache_dir": data_cfg.get("web_shard_cache_dir"),
+        "web_shard_cache_max_shards": int(data_cfg.get("web_shard_cache_max_shards", 3)),
+        "web_shard_delete_after_use": bool(data_cfg.get("web_shard_delete_after_use", False)),
+        "web_shard_download_retries": int(data_cfg.get("web_shard_download_retries", 6)),
+        "web_shard_download_timeout_s": int(data_cfg.get("web_shard_download_timeout_s", 120)),
     }
 
     if use_webdataset:
@@ -1324,6 +1343,10 @@ def train() -> None:
     train_cfg = cfg["train"]
     model_cfg = dict(cfg["model"])
     model_cfg.setdefault("fg_representation", str(cfg["data"].get("fg_representation", "premul")))
+    if "rematerialize_activations" in train_cfg:
+        model_cfg["gradient_checkpointing"] = bool(train_cfg["rematerialize_activations"])
+    elif "activation_rematerialization" in train_cfg:
+        model_cfg["gradient_checkpointing"] = bool(train_cfg["activation_rematerialization"])
     cfg["model"] = model_cfg
     loss_cfg = cfg["loss"]
 
@@ -1609,6 +1632,30 @@ def train() -> None:
     scaler_device = ddp.device.type if ddp.device.type in {"cuda", "cpu"} else "cuda"
     scaler = torch.amp.GradScaler(scaler_device, enabled=use_scaler)
 
+    ema_cfg = dict(train_cfg.get("ema", {}) or {})
+    ema_enabled = bool(ema_cfg.get("enabled", train_cfg.get("ema_enabled", False)))
+    ema_decay = float(ema_cfg.get("decay", train_cfg.get("ema_decay", 0.9999)))
+    ema_update_after_step = int(ema_cfg.get("update_after_step", train_cfg.get("ema_update_after_step", 0)))
+    ema_update_every = max(1, int(ema_cfg.get("update_every", train_cfg.get("ema_update_every", 1))))
+    ema_device_name = str(ema_cfg.get("device", train_cfg.get("ema_device", "model"))).strip().lower()
+    if ema_device_name in {"model", "same", ""}:
+        ema_device: torch.device | None = None
+    elif ema_device_name == "cpu":
+        ema_device = torch.device("cpu")
+    elif ema_device_name in {"cuda", "gpu"}:
+        ema_device = ddp.device if ddp.device.type == "cuda" else None
+        if ema_device is None:
+            _maybe_print(rank0_debug_console, "Training notice: train.ema.device=cuda ignored on non-CUDA device.")
+    else:
+        raise ValueError("train.ema.device must be one of: model, cpu, cuda")
+    model_ema = ModelEma(model, decay=ema_decay, device=ema_device) if ema_enabled else None
+    if model_ema is not None:
+        _maybe_print(
+            rank0_debug_console,
+            f"Model EMA enabled: decay={ema_decay}, update_after_step={ema_update_after_step}, "
+            f"update_every={ema_update_every}, device={ema_device_name or 'model'}",
+        )
+
     criterion = V3MattingLossComputer(
         weights=loss_cfg,
         fg_representation=str(cfg["data"].get("fg_representation", "premul")),
@@ -1623,6 +1670,8 @@ def train() -> None:
                 model=model,
                 device=ddp.device,
             )
+            if model_ema is not None:
+                model_ema.reset(model)
             _maybe_print(
                 rank0_debug_console,
                 f"Loaded model weights from {args.resume} "
@@ -1636,6 +1685,7 @@ def train() -> None:
                 optimizer=optimizer,
                 scheduler=scheduler,
                 scaler=scaler if use_scaler else None,
+                model_ema=model_ema,
                 device=ddp.device,
             )
             _maybe_print(
@@ -1695,9 +1745,22 @@ def train() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     filesystem_sync_session = _init_filesystem_sync_session(output_dir, ddp)
+    wandb_logger = init_wandb_logger(
+        cfg,
+        output_dir=output_dir,
+        rank0=is_rank0(),
+        model=model,
+        debug_console=rank0_debug_console,
+    )
 
     epochs = int(train_cfg.get("epochs", 40))
     log_interval = int(train_cfg.get("log_interval", 20))
+    wandb_cfg = dict(train_cfg.get("wandb", {}) or {})
+    wandb_log_interval = max(1, int(wandb_cfg.get("log_interval", log_interval)))
+    wandb_loss_ema_decay = float(wandb_cfg.get("loss_ema_decay", 0.98))
+    if not 0.0 <= wandb_loss_ema_decay < 1.0:
+        raise ValueError("train.wandb.loss_ema_decay must be >= 0.0 and < 1.0")
+    wandb_loss_ema: float | None = None
     save_interval = int(train_cfg.get("save_interval", 1))
     checkpoint_sync_timeout_minutes = float(
         train_cfg.get(
@@ -1919,6 +1982,7 @@ def train() -> None:
                 optimizer=optimizer,
                 scheduler=scheduler,
                 scaler=scaler if use_scaler else None,
+                model_ema=model_ema,
                 epoch=ep,
                 global_step=gs,
                 config=cfg,
@@ -2299,9 +2363,12 @@ def train() -> None:
                             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
 
                     with nvtx_range("optimizer_step"):
+                        optimizer_step_ran = True
                         if use_scaler:
+                            old_scale = float(scaler.get_scale())
                             scaler.step(optimizer)
                             scaler.update()
+                            optimizer_step_ran = float(scaler.get_scale()) >= old_scale
                         else:
                             optimizer.step()
 
@@ -2309,6 +2376,14 @@ def train() -> None:
                         scheduler.step()
                     global_step += 1
                     _handler_state["global_step"] = global_step
+                    if (
+                        model_ema is not None
+                        and optimizer_step_ran
+                        and global_step > ema_update_after_step
+                        and global_step % ema_update_every == 0
+                    ):
+                        with nvtx_range("ema_update"):
+                            model_ema.update(model)
 
                     if max_steps > 0 and global_step >= max_steps:
                         ckpt_path = output_dir / f"checkpoint_step_{global_step:06d}.pt"
@@ -2325,11 +2400,18 @@ def train() -> None:
                                 optimizer=optimizer,
                                 scheduler=scheduler,
                                 scaler=scaler if use_scaler else None,
+                                model_ema=model_ema,
                                 epoch=epoch,
                                 global_step=global_step,
                                 config=cfg,
                             )
                             tqdm.write(f"Saved checkpoint: {ckpt_path}")
+                            wandb_logger.log_checkpoint(
+                                ckpt_path,
+                                epoch=epoch,
+                                global_step=global_step,
+                                aliases=["latest", f"step-{global_step:06d}"],
+                            )
 
                         _save_checkpoint_with_filesystem_rendezvous(
                             ddp=ddp,
@@ -2345,8 +2427,11 @@ def train() -> None:
                     optimizer.zero_grad(set_to_none=True)
 
                 should_log = (it + 1) % log_interval == 0
+                should_wandb_log = wandb_logger.enabled and (global_step % wandb_log_interval == 0)
                 if args.profile and not profile_log_metrics:
                     should_log = False
+                    should_wandb_log = False
+                should_metric_log = should_log or should_wandb_log
 
                 running_loss = running_loss + batch_total_loss.detach().to(dtype=torch.float32)
 
@@ -2367,7 +2452,11 @@ def train() -> None:
                     loss_for_bar = None
 
                 reduced_items_t: Dict[str, torch.Tensor] | None = None
-                if should_log:
+                reduced_total_loss_t: torch.Tensor | None = None
+                if should_metric_log:
+                    reduced_total_loss_t = batch_total_loss.detach()
+                    if sync_log_metrics and ddp.is_distributed:
+                        reduced_total_loss_t = reduce_scalar(reduced_total_loss_t, average=True)
                     if sync_log_metrics and ddp.is_distributed:
                         reduced_items_t = {
                             k: reduce_scalar(v, average=True) for k, v in batch_loss_items.items()
@@ -2383,14 +2472,39 @@ def train() -> None:
                     else:
                         pbar.set_postfix(lr=lr_str, step=global_step)
 
-                if should_log and is_rank0() and reduced_items_t is not None:
+                if should_metric_log and is_rank0() and reduced_items_t is not None:
                     reduced_items = {k: float(v.detach().to(device="cpu")) for k, v in reduced_items_t.items()}
-                    reduced_items_str = " ".join(f"{k}={v:.4f}" for k, v in reduced_items.items())
-                    lr = optimizer.param_groups[0]["lr"]
-                    tqdm.write(
-                        f"epoch={epoch:03d} iter={it + 1:05d}/{len(dataloader):05d} "
-                        f"step={global_step:06d} lr={lr:.2e} {reduced_items_str}"
+                    reduced_total_loss = (
+                        float(reduced_total_loss_t.detach().to(device="cpu"))
+                        if reduced_total_loss_t is not None
+                        else float(batch_total_loss.detach().to(device="cpu"))
                     )
+                    lr = optimizer.param_groups[0]["lr"]
+                    if should_log:
+                        reduced_items_str = " ".join(f"{k}={v:.4f}" for k, v in reduced_items.items())
+                        tqdm.write(
+                            f"epoch={epoch:03d} iter={it + 1:05d}/{len(dataloader):05d} "
+                            f"step={global_step:06d} lr={lr:.2e} {reduced_items_str}"
+                        )
+                    if should_wandb_log:
+                        if wandb_loss_ema is None:
+                            wandb_loss_ema = reduced_total_loss
+                        else:
+                            wandb_loss_ema = (
+                                wandb_loss_ema_decay * wandb_loss_ema
+                                + (1.0 - wandb_loss_ema_decay) * reduced_total_loss
+                            )
+                        wandb_logger.log(
+                            {
+                                "train/loss": reduced_total_loss,
+                                "train/loss_ema": wandb_loss_ema,
+                                "train/lr": float(lr),
+                                "train/epoch": int(epoch),
+                                "train/iter": int(it + 1),
+                                **{f"train/{k}": v for k, v in reduced_items.items()},
+                            },
+                            step=global_step,
+                        )
 
                 if prof is not None:
                     prof.step()
@@ -2487,11 +2601,18 @@ def train() -> None:
                         optimizer=optimizer,
                         scheduler=scheduler,
                         scaler=scaler if use_scaler else None,
+                        model_ema=model_ema,
                         epoch=epoch,
                         global_step=global_step,
                         config=cfg,
                     )
                     tqdm.write(f"Saved checkpoint: {ckpt_path}")
+                    wandb_logger.log_checkpoint(
+                        ckpt_path,
+                        epoch=epoch,
+                        global_step=global_step,
+                        aliases=["latest", f"epoch-{epoch:03d}", f"step-{global_step:06d}"],
+                    )
 
                 _save_checkpoint_with_filesystem_rendezvous(
                     ddp=ddp,
@@ -2506,7 +2627,12 @@ def train() -> None:
             if ddp.is_distributed:
                 epoch_loss = reduce_scalar(epoch_loss, average=True)
             if is_rank0():
-                tqdm.write(f"[epoch {epoch:03d}] avg_total_loss={float(epoch_loss.detach().to(device='cpu')):.6f}")
+                epoch_loss_value = float(epoch_loss.detach().to(device="cpu"))
+                tqdm.write(f"[epoch {epoch:03d}] avg_total_loss={epoch_loss_value:.6f}")
+                wandb_logger.log(
+                    {"epoch/avg_total_loss": epoch_loss_value, "epoch": int(epoch)},
+                    step=global_step,
+                )
 
     except KeyboardInterrupt:
         _interrupted = True
@@ -2549,6 +2675,7 @@ def train() -> None:
                     optimizer=optimizer,
                     scheduler=scheduler,
                     scaler=scaler if use_scaler else None,
+                    model_ema=model_ema,
                     epoch=epoch if "epoch" in locals() else start_epoch,
                     global_step=global_step,
                     config=cfg,
@@ -2562,6 +2689,7 @@ def train() -> None:
         elif not _interrupted and is_rank0():
             tqdm.write("Training completed.")
 
+        wandb_logger.finish()
         cleanup_distributed()
 
 

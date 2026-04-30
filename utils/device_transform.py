@@ -483,10 +483,13 @@ class DeviceMattingTransform(nn.Module):
         bg = _sanitize_color_tensor(batch["bg_gt"])
         alpha = _sanitize_unit_tensor(batch["alpha_gt"])
         emit_global_context = int(cfg.global_context_long_side) > 0
+        has_precomputed_global_input = isinstance(batch.get("global_input_gt"), Tensor)
+        has_precomputed_global_fg = isinstance(batch.get("global_fg_gt"), Tensor)
+        has_precomputed_global_alpha = isinstance(batch.get("global_alpha_gt"), Tensor)
         precomputed_global = (
             emit_global_context
-            and isinstance(batch.get("global_input_gt"), Tensor)
-            and isinstance(batch.get("global_alpha_gt"), Tensor)
+            and has_precomputed_global_alpha
+            and (has_precomputed_global_input or has_precomputed_global_fg)
         )
 
         if fg.ndim != 5:
@@ -525,9 +528,18 @@ class DeviceMattingTransform(nn.Module):
 
         global_input_gt: Optional[Tensor]
         if emit_global_context and precomputed_global:
-            global_input_gt = _sanitize_color_tensor(batch["global_input_gt"].to(device=fg.device, dtype=fg.dtype))
+            global_input_gt = (
+                _sanitize_color_tensor(batch["global_input_gt"].to(device=fg.device, dtype=fg.dtype))
+                if has_precomputed_global_input
+                else None
+            )
+            global_fg = (
+                _sanitize_color_tensor(batch["global_fg_gt"].to(device=fg.device, dtype=fg.dtype))
+                if has_precomputed_global_fg
+                else None
+            )
             global_alpha = _sanitize_unit_tensor(batch["global_alpha_gt"].to(device=fg.device, dtype=alpha.dtype))
-            global_fg = global_bg = None
+            global_bg = None
         elif emit_global_context:
             global_input_gt = None
             global_fg = fg
@@ -620,8 +632,9 @@ class DeviceMattingTransform(nn.Module):
         bg_gain = random.uniform(cfg.bg_gain_min, cfg.bg_gain_max)
         fg = fg * subject_gain
         bg = bg * bg_gain
-        if emit_global_context and global_fg is not None and global_bg is not None:
+        if emit_global_context and global_fg is not None:
             global_fg = global_fg * subject_gain
+        if emit_global_context and global_bg is not None:
             global_bg = global_bg * bg_gain
 
         # ---- WB jitter ----
@@ -639,8 +652,9 @@ class DeviceMattingTransform(nn.Module):
             fg = fg * wb
             bg = bg * wb
             if emit_global_context:
-                if global_fg is not None and global_bg is not None:
+                if global_fg is not None:
                     global_fg = global_fg * wb
+                if global_bg is not None:
                     global_bg = global_bg * wb
                 elif global_input_gt is not None:
                     global_input_gt = global_input_gt * wb
@@ -654,10 +668,14 @@ class DeviceMattingTransform(nn.Module):
         if emit_global_context:
             assert global_alpha is not None
             if global_input_gt is None:
-                assert global_fg is not None and global_bg is not None
+                if global_fg is not None and global_bg is not None:
+                    global_fg = _fg_target_from_premul(global_fg, global_alpha, fg_representation)
+                    global_input_gt = _composite_fg(global_fg, global_bg, global_alpha, fg_representation)
+                elif global_fg is not None:
+                    global_fg = _fg_target_from_premul(global_fg, global_alpha, fg_representation)
+            elif global_fg is not None:
                 global_fg = _fg_target_from_premul(global_fg, global_alpha, fg_representation)
-                global_input_gt = _composite_fg(global_fg, global_bg, global_alpha, fg_representation)
-            global_fg = global_bg = None
+            global_bg = None
         else:
             global_input_gt = None
 
@@ -840,7 +858,7 @@ class DeviceMattingTransform(nn.Module):
                 global_coarse = global_coarse * (1.0 - global_drop)
             if global_fg is not None:
                 out["global_fg_gt"] = global_fg
-            out["global_video_rgb"] = global_fg if global_fg is not None else global_input_gt
+            out["global_video_rgb"] = global_input_gt if global_input_gt is not None else global_fg
             out["global_coarse_alpha_init"] = global_coarse
             out["tile_coords"] = tile_coords
             out["source_hw"] = source_hw

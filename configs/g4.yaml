@@ -15,7 +15,7 @@ model:
   memory_tokens: 64
   temporal_window: 5
   drop_path_rate: 0.1
-  gradient_checkpointing: false
+  gradient_checkpointing: true
   decoder_out_dim: 256
 
   # V3 features
@@ -95,6 +95,9 @@ data:
   emit_tile_metadata: true
   decode_global_context: false
   global_context_modalities: [Input, Alpha, FG]
+  web_shard_cache_dir: /tmp/corridorkey_wds_cache
+  web_shard_cache_max_shards: 3
+  web_shard_delete_after_use: false
   num_workers: 24                  # Scaled for 48-thread CPU
   prefetch_factor: 3               # Bumped up now that shuffle buffers are fixed
   persistent_workers: true
@@ -115,12 +118,25 @@ train:
   temporal_batch_size: 16          # Matches clip_len
   debug_console: true
   grad_accum_steps: 1
+  rematerialize_activations: true
+  ema:
+    enabled: true
+    decay: 0.9999
+    update_after_step: 0
+    update_every: 1
+    device: model
 
   compile: false
   compile_dynamic: true
   cuda_warmup: false
   cuda_prefetch: true
   cuda_prefetch_queue: 6           # Increased for deeper pipeline
+  wandb:
+    enabled: false
+    entity: vanoinc
+    project: CorridorKeyV2
+    # Optional: set name/group/tags/mode here or via WANDB_* env vars.
+    log_checkpoints: false
 loss:
   alpha_l1: 1.0
   alpha_laplacian: 1.0

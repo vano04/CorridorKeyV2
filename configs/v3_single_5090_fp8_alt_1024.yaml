@@ -14,7 +14,7 @@ model:
   memory_tokens: 64
   temporal_window: 5
   drop_path_rate: 0.1
-  gradient_checkpointing: false
+  gradient_checkpointing: true
   decoder_out_dim: 256
 
   # V3 features
@@ -114,12 +114,25 @@ train:
   temporal_batch_size: 8
   debug_console: true
   grad_accum_steps: 1
+  rematerialize_activations: true
+  ema:
+    enabled: true
+    decay: 0.9999
+    update_after_step: 0
+    update_every: 1
+    device: model
 
   compile: false
   compile_dynamic: true
   cuda_warmup: false
   cuda_prefetch: true
   cuda_prefetch_queue: 3
+  wandb:
+    enabled: true
+    entity: vanoinc
+    project: CorridorKeyV2
+    log_interval: 5
+    log_checkpoints: false
 loss:
   alpha_l1: 1.0
   alpha_laplacian: 1.0

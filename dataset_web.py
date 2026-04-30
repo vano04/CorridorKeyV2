@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+import fcntl
 import fnmatch
 import io
 import json
@@ -9,9 +10,12 @@ import math
 import os
 import random
 import re
+import time
 import tarfile
 import tempfile
 import threading
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO, Callable, Dict, List, Optional, Sequence, Tuple
@@ -512,6 +516,11 @@ def _load_member_tensor(
 
 import webdataset as wds
 import huggingface_hub
+from webdataset import tariterators
+
+
+DEFAULT_WEB_DATASET_REPO = "Vano04/CorridorKeyDataset_Custom"
+DEFAULT_WEB_SHARD_CACHE_DIR = Path(tempfile.gettempdir()) / "corridorkey_wds_cache"
 
 def clip_to_windows(clip_sample, sequence_length, frame_stride, sequence_stride, modalities, convert_to_float, clip_len_range, decode_full_frame, exr_tile_size, local_tile_span, source_hw, emit_tile_metadata, transform, global_context_long_side, global_context_modalities, decode_global_context):
     key = clip_sample.get("__key__", "unknown")
@@ -637,6 +646,268 @@ def clip_to_windows(clip_sample, sequence_length, frame_stride, sequence_stride,
             
         yield out_sample
 
+
+def _resolve_web_shard_cache_dir(cache_dir: Optional[str | os.PathLike[str]]) -> Path:
+    if cache_dir is None:
+        return DEFAULT_WEB_SHARD_CACHE_DIR
+    raw = str(cache_dir).strip()
+    if not raw:
+        return DEFAULT_WEB_SHARD_CACHE_DIR
+    return Path(raw).expanduser()
+
+
+def _cache_lock_path(cache_dir: Path) -> Path:
+    return cache_dir / ".cache.lock"
+
+
+def _shard_lock_path(local_path: Path) -> Path:
+    return local_path.with_name(f"{local_path.name}.lock")
+
+
+def _lease_glob(local_path: Path) -> str:
+    return f"{local_path.name}.lease.*"
+
+
+def _local_shard_name(remote_url: str) -> str:
+    name = Path(urllib.parse.urlparse(remote_url).path).name
+    if not name.endswith(".tar"):
+        raise RuntimeError(f"Expected remote shard URL ending in .tar, got: {remote_url}")
+    return name
+
+
+def _local_shard_path(cache_dir: Path, remote_url: str) -> Path:
+    return cache_dir / _local_shard_name(remote_url)
+
+
+def _touch_file(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a+b"):
+        os.utime(path, None)
+
+
+def _download_shard_to_path(
+    *,
+    remote_url: str,
+    local_path: Path,
+    token: str,
+    download_retries: int,
+    download_timeout_s: int,
+) -> None:
+    attempts = max(1, int(download_retries))
+    timeout = max(30, int(download_timeout_s))
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+
+    for attempt in range(1, attempts + 1):
+        tmp_path = local_path.with_name(
+            f"{local_path.name}.part.{os.getpid()}.{threading.get_ident()}"
+        )
+        try:
+            req = urllib.request.Request(
+                remote_url,
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as response, open(tmp_path, "wb") as handle:
+                while True:
+                    chunk = response.read(16 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+
+            if tmp_path.stat().st_size <= 0:
+                raise RuntimeError(f"Downloaded empty shard from {remote_url}")
+
+            os.replace(tmp_path, local_path)
+            os.utime(local_path, None)
+            return
+        except Exception:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+            if attempt >= attempts:
+                raise
+            time.sleep(min(10.0, float(attempt)))
+
+
+def _ensure_local_shard(
+    *,
+    remote_url: str,
+    token: str,
+    cache_dir: Path,
+    download_retries: int,
+    download_timeout_s: int,
+) -> Path:
+    local_path = _local_shard_path(cache_dir, remote_url)
+    lock_path = _shard_lock_path(local_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(lock_path, "a+b") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        try:
+            if local_path.exists() and local_path.stat().st_size > 0:
+                os.utime(local_path, None)
+                return local_path
+
+            _download_shard_to_path(
+                remote_url=remote_url,
+                local_path=local_path,
+                token=token,
+                download_retries=download_retries,
+                download_timeout_s=download_timeout_s,
+            )
+            return local_path
+        finally:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+
+def _create_shard_lease(local_path: Path) -> Path:
+    lease_name = (
+        f"{local_path.name}.lease.{os.getpid()}."
+        f"{threading.get_ident()}.{time.time_ns()}"
+    )
+    lease_path = local_path.with_name(lease_name)
+    _touch_file(lease_path)
+    return lease_path
+
+
+def _release_shard_lease(lease_path: Path) -> None:
+    try:
+        lease_path.unlink()
+    except OSError:
+        pass
+
+
+def _shard_has_leases(local_path: Path) -> bool:
+    return any(local_path.parent.glob(_lease_glob(local_path)))
+
+
+def _delete_local_shard_if_idle(local_path: Path) -> None:
+    cache_dir = local_path.parent
+    with open(_cache_lock_path(cache_dir), "a+b") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        try:
+            if local_path.exists() and not _shard_has_leases(local_path):
+                try:
+                    local_path.unlink()
+                except OSError:
+                    pass
+        finally:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+
+def _evict_local_shard_cache(
+    *,
+    cache_dir: Path,
+    max_shards: int,
+    exclude_paths: Sequence[Path] = (),
+) -> None:
+    if max_shards < 1:
+        return
+
+    excluded = {path.resolve() for path in exclude_paths}
+    with open(_cache_lock_path(cache_dir), "a+b") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        try:
+            shard_paths = sorted(
+                (path for path in cache_dir.glob("*.tar") if path.is_file()),
+                key=lambda path: path.stat().st_mtime,
+            )
+            active_count = len(shard_paths)
+            for shard_path in shard_paths:
+                if active_count <= max_shards:
+                    break
+                try:
+                    resolved = shard_path.resolve()
+                except OSError:
+                    resolved = shard_path
+                if resolved in excluded:
+                    continue
+                if _shard_has_leases(shard_path):
+                    continue
+                try:
+                    shard_path.unlink()
+                    active_count -= 1
+                except OSError:
+                    continue
+        finally:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+
+def _local_shard_opener(
+    src: Sequence[Dict[str, Any]] | Any,
+    *,
+    token: str,
+    cache_dir: Path,
+    max_local_shards: int,
+    delete_after_use: bool,
+    download_retries: int,
+    download_timeout_s: int,
+    handler: Callable[[Exception], bool],
+):
+    for sample in src:
+        assert isinstance(sample, dict), sample
+        assert "url" in sample
+        remote_url = str(sample["url"])
+        try:
+            local_path = _ensure_local_shard(
+                remote_url=remote_url,
+                token=token,
+                cache_dir=cache_dir,
+                download_retries=download_retries,
+                download_timeout_s=download_timeout_s,
+            )
+            lease_path = _create_shard_lease(local_path)
+            try:
+                with open(local_path, "rb") as stream:
+                    localised = dict(sample)
+                    localised["stream"] = stream
+                    localised["local_path"] = str(local_path)
+                    yield localised
+            finally:
+                _release_shard_lease(lease_path)
+                if delete_after_use:
+                    _delete_local_shard_if_idle(local_path)
+                else:
+                    try:
+                        os.utime(local_path, None)
+                    except OSError:
+                        pass
+                    _evict_local_shard_cache(
+                        cache_dir=cache_dir,
+                        max_shards=max_local_shards,
+                        exclude_paths=(local_path,),
+                    )
+        except Exception as exn:
+            exn.args = exn.args + (remote_url,)
+            if handler(exn):
+                continue
+            raise
+
+
+def _local_tarfile_to_samples(
+    src,
+    *,
+    token: str,
+    cache_dir: Path,
+    max_local_shards: int,
+    delete_after_use: bool,
+    download_retries: int,
+    download_timeout_s: int,
+    handler: Callable[[Exception], bool],
+):
+    streams = _local_shard_opener(
+        src,
+        token=token,
+        cache_dir=cache_dir,
+        max_local_shards=max_local_shards,
+        delete_after_use=delete_after_use,
+        download_retries=download_retries,
+        download_timeout_s=download_timeout_s,
+        handler=handler,
+    )
+    files = tariterators.tar_file_expander(streams, handler=handler)
+    return tariterators.group_by_keys(files, handler=handler)
+
 def create_dataset_pipeline(
     sequence_length: int = 1,
     frame_stride: int = 1,
@@ -655,15 +926,23 @@ def create_dataset_pipeline(
     global_context_modalities: Sequence[str] = ("FG", "Alpha"),
     split: str = "all",
     validation_shard_indices: Optional[Sequence[int]] = None,
+    webdataset_repo_id: str = DEFAULT_WEB_DATASET_REPO,
+    web_shard_cache_dir: Optional[str] = None,
+    web_shard_cache_max_shards: int = 3,
+    web_shard_delete_after_use: bool = False,
+    web_shard_download_retries: int = 6,
+    web_shard_download_timeout_s: int = 120,
     **kwargs # ignore other kwargs for compatibility
 ):
     token = huggingface_hub.get_token()
     if not token:
         raise RuntimeError("No huggingface token found. Please run huggingface-cli login.")
     
-    auth_header = f"Authorization: Bearer {token}"
     api = huggingface_hub.HfApi()
-    info = api.dataset_info("Vano04/CorridorKeyDataset_Custom")
+    repo_id = str(webdataset_repo_id or DEFAULT_WEB_DATASET_REPO).strip()
+    info = api.dataset_info(repo_id)
+    cache_dir = _resolve_web_shard_cache_dir(web_shard_cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
     
     val_indices = set(validation_shard_indices) if validation_shard_indices else set()
     split_key = str(split).strip().lower()
@@ -682,7 +961,13 @@ def create_dataset_pipeline(
             if split_key == "train" and is_val:
                 continue
                 
-            urls.append(f"pipe:curl -s -L -H '{auth_header}' --retry 10 --retry-connrefused --retry-delay 2 https://huggingface.co/datasets/Vano04/CorridorKeyDataset_Custom/resolve/main/{f.rfilename}")
+            urls.append(
+                huggingface_hub.hf_hub_url(
+                    repo_id=repo_id,
+                    filename=f.rfilename,
+                    repo_type="dataset",
+                )
+            )
             
     if not urls:
         raise RuntimeError(f"No URLs found for split {split_key}")
@@ -697,8 +982,19 @@ def create_dataset_pipeline(
             wds.split_by_worker
         ]
     
-    # decode the tar stream
-    pipeline.append(wds.tarfile_to_samples(handler=wds.warn_and_continue))
+    # Materialise remote shards locally before WebDataset expands them.
+    pipeline.append(
+        lambda src: _local_tarfile_to_samples(
+            src,
+            token=token,
+            cache_dir=cache_dir,
+            max_local_shards=max(1, int(web_shard_cache_max_shards)),
+            delete_after_use=bool(web_shard_delete_after_use),
+            download_retries=max(1, int(web_shard_download_retries)),
+            download_timeout_s=max(30, int(web_shard_download_timeout_s)),
+            handler=wds.warn_and_continue,
+        )
+    )
     
     if split_key == "train":
         # Buffer a small number of full clips to mix them up without OOMing.

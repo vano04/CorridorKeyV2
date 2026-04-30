@@ -94,6 +94,10 @@ train:
   inference_mode: hybrid
   temporal_batch_size: 4
   debug_console: true
+  wandb:
+    enabled: false
+    entity: vanoinc
+    project: CorridorKeyV2
 
 loss:
   alpha_l1: 1.0

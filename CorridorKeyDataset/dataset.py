@@ -357,9 +357,39 @@ def _load_exr_from_path_newapi(path: str, tile_grid: Optional[Tuple[int, int, in
     return _compose_array_from_channels(channels)
 
 
+def _load_exr_tiles_from_path_newapi(
+    path: str,
+    tile_grids: Sequence[Tuple[int, int, int, int]],
+) -> List[np.ndarray]:
+    arrays: List[np.ndarray] = []
+    with OpenEXR.File(path, header_only=True) as exr:
+        for xmin, xmax, ymin, ymax in tile_grids:
+            channels = {
+                name: ch.pixels
+                for name, ch in exr.readTiles(xmin, xmax, ymin, ymax, separate_channels=True).items()
+            }
+            arrays.append(_compose_array_from_channels(channels))
+    return arrays
+
+
 def _to_frame_tensor(array: np.ndarray, convert_to_float: bool) -> Tensor:
     tensor = _ensure_chw_tensor(array)
     return _normalize_image_tensor(tensor) if convert_to_float else tensor
+
+
+def _downscale_2x_box_chw(tensor: Tensor, *, accumulate_dtype: torch.dtype = torch.float16) -> Tensor:
+    h_even = (int(tensor.shape[-2]) // 2) * 2
+    w_even = (int(tensor.shape[-1]) // 2) * 2
+    if h_even < 2 or w_even < 2:
+        return tensor
+    x = tensor[..., :h_even, :w_even].to(dtype=accumulate_dtype)
+    out = (
+        x[..., 0::2, 0::2]
+        + x[..., 1::2, 0::2]
+        + x[..., 0::2, 1::2]
+        + x[..., 1::2, 1::2]
+    ) * 0.25
+    return out.to(dtype=tensor.dtype)
 
 
 def _coerce_source_hw(source_hw: Optional[Sequence[int]]) -> Tuple[int, int]:
@@ -467,6 +497,22 @@ def _load_payload_via_tmpfile(payload: bytes, tile_grid: Optional[Tuple[int, int
             pass
 
 
+def _load_payload_tiles_via_tmpfile(
+    payload: bytes,
+    tile_grids: Sequence[Tuple[int, int, int, int]],
+) -> List[np.ndarray]:
+    fd, tmp_path = tempfile.mkstemp(suffix=".exr", dir=_TMPFS_DIR)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+        return _load_exr_tiles_from_path_newapi(tmp_path, tile_grids=tile_grids)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
 def load_frame_bytes(payload: bytes, convert_to_float: bool = True, tile_grid: Optional[Tuple[int, int, int, int]] = None) -> Tensor:
     if not payload:
         raise RuntimeError("Cannot decode empty frame payload")
@@ -543,6 +589,7 @@ class CorridorKeySequenceDataset(Dataset):
         global_context_root_dir: Path | str | None = None,
         global_context_long_side: int = 0,
         global_context_modalities: Sequence[str] = ("FG", "Alpha"),
+        **_compat_kwargs: object,
     ) -> None:
         super().__init__()
 
@@ -884,6 +931,7 @@ class CorridorKeyWebSequenceDataset(Dataset):
         global_context_root_dir: Path | str | None = None,
         global_context_long_side: int = 0,
         global_context_modalities: Sequence[str] = ("FG", "Alpha"),
+        **_compat_kwargs: object,
     ) -> None:
         super().__init__()
 
@@ -1027,10 +1075,134 @@ class CorridorKeyWebSequenceDataset(Dataset):
             f"frame={frame_number} in shard {clip.shard_path}"
         )
 
+    def _resolve_global_or_frame_member(
+        self,
+        clip: WebClipIndex,
+        modality: str,
+        frame_number: int,
+    ) -> Tuple[TarMemberRef, bool]:
+        try:
+            return self._resolve_global_member(
+                clip=clip,
+                modality=modality,
+                frame_number=frame_number,
+            ), False
+        except KeyError:
+            return self._resolve_member(
+                clip=clip,
+                modality=modality,
+                frame_number=frame_number,
+            ), True
+
+    def _resize_global_tensor_if_needed(self, tensor: Tensor, fallback_from_frame: bool) -> Tensor:
+        if not fallback_from_frame or self.global_context_long_side <= 0:
+            return tensor
+        h, w = tensor.shape[-2:]
+        long_side = max(h, w)
+        target_long_side = int(self.global_context_long_side)
+        if long_side == target_long_side:
+            return tensor
+        scale = target_long_side / float(long_side)
+        target_h = max(1, int(round(h * scale)))
+        target_w = max(1, int(round(w * scale)))
+        resized = torch.nn.functional.interpolate(
+            tensor.unsqueeze(0),
+            size=(target_h, target_w),
+            mode="bilinear",
+            align_corners=False,
+        )
+        return resized.squeeze(0)
+
+    def _global_frame_fallback_tile_grid(self) -> Tuple[int, int, int, int]:
+        source_h, source_w = self.source_hw
+        tile = max(1, int(self.exr_tile_size))
+        tiles_y = max(1, int(math.ceil(source_h / tile)))
+        tiles_x = max(1, int(math.ceil(source_w / tile)))
+        return (0, tiles_x - 1, 0, tiles_y - 1)
+
+    def _fast_global_context_from_frame_member(
+        self,
+        shard_path: Path,
+        member: TarMemberRef,
+        tile_grid: Optional[Tuple[int, int, int, int]],
+        convert_to_float: bool,
+    ) -> Optional[Tensor]:
+        if not _USE_NEW_EXR_API or tile_grid is None or self.global_context_long_side <= 0:
+            return None
+
+        source_h, source_w = self.source_hw
+        source_long = max(source_h, source_w)
+        target_long = int(self.global_context_long_side)
+        if source_long != target_long * 2:
+            return None
+
+        target_h = max(1, int(round(source_h * (target_long / float(source_long)))))
+        target_w = max(1, int(round(source_w * (target_long / float(source_long)))))
+        context_h = target_h * 2
+        context_w = target_w * 2
+        if context_h > source_h or context_w > source_w:
+            return None
+
+        native_tile = max(1, int(self.exr_tile_size))
+        tx0, _, ty0, _ = tile_grid
+        tile_y0 = ty0 * native_tile
+        tile_x0 = tx0 * native_tile
+        context_y0 = min(max(0, tile_y0), max(0, source_h - context_h))
+        context_x0 = min(max(0, tile_x0), max(0, source_w - context_w))
+        half_h = context_h // 2
+        half_w = context_w // 2
+        if half_h <= 0 or half_w <= 0:
+            return None
+
+        def _grid_for(y0: int, x0: int, y1: int, x1: int) -> Tuple[int, int, int, int]:
+            return (
+                x0 // native_tile,
+                max(x0 // native_tile, (x1 - 1) // native_tile),
+                y0 // native_tile,
+                max(y0 // native_tile, (y1 - 1) // native_tile),
+            )
+
+        specs: List[Tuple[int, int, int, int, int, int, int]] = []
+        grids: List[Tuple[int, int, int, int]] = []
+        for y_off in (0, half_h):
+            for x_off in (0, half_w):
+                y0 = context_y0 + y_off
+                x0 = context_x0 + x_off
+                y1 = min(source_h, y0 + half_h)
+                x1 = min(source_w, x0 + half_w)
+                grid = _grid_for(y0, x0, y1, x1)
+                local_y0 = y0 - (y0 // native_tile) * native_tile
+                local_x0 = x0 - (x0 // native_tile) * native_tile
+                crop_h = y1 - y0
+                crop_w = x1 - x0
+                specs.append((y_off, x_off, crop_h, crop_w, local_y0, local_x0, len(grids)))
+                grids.append(grid)
+
+        if _USE_NEW_EXR_API:
+            payload = _read_member_payload(shard_path, member)
+            tensors = [
+                _to_frame_tensor(array, convert_to_float)
+                for array in _load_payload_tiles_via_tmpfile(payload, grids)
+            ]
+        else:
+            tensors = [
+                _load_member_tensor(shard_path, member, convert_to_float, tile_grid=grid)
+                for grid in grids
+            ]
+
+        c = int(tensors[0].shape[0])
+        canvas = torch.empty((c, context_h, context_w), dtype=tensors[0].dtype)
+        for y_off, x_off, crop_h, crop_w, local_y0, local_x0, tensor_idx in specs:
+            tensor = tensors[tensor_idx]
+            piece = tensor[:, local_y0 : local_y0 + crop_h, local_x0 : local_x0 + crop_w]
+            canvas[:, y_off : y_off + crop_h, x_off : x_off + crop_w] = piece
+        return _downscale_2x_box_chw(canvas, accumulate_dtype=torch.float16)
+
     def _load_global_modalities_webdataset(
         self,
         clip: WebClipIndex,
         frame_numbers: Sequence[int],
+        tile_grid: Optional[Tuple[int, int, int, int]] = None,
     ) -> Dict[str, Tensor]:
         if not self.decode_global_context:
             return {}
@@ -1039,12 +1211,24 @@ class CorridorKeyWebSequenceDataset(Dataset):
         pool = self._get_decode_pool()
         by_mod: Dict[str, Tensor] = {}
 
-        def _do(member: TarMemberRef) -> Tensor:
-            return _load_member_tensor(shard_path, member, convert, tile_grid=None)
+        def _do(item: Tuple[TarMemberRef, bool]) -> Tensor:
+            member, fallback_from_frame = item
+            if fallback_from_frame:
+                fast_tensor = self._fast_global_context_from_frame_member(
+                    shard_path,
+                    member,
+                    tile_grid,
+                    convert,
+                )
+                if fast_tensor is not None:
+                    return fast_tensor
+            read_tile_grid = self._global_frame_fallback_tile_grid() if fallback_from_frame else None
+            tensor = _load_member_tensor(shard_path, member, convert, tile_grid=read_tile_grid)
+            return self._resize_global_tensor_if_needed(tensor, fallback_from_frame)
 
         for modality in self.global_context_modalities:
             members = [
-                self._resolve_global_member(clip=clip, modality=modality, frame_number=fn)
+                self._resolve_global_or_frame_member(clip=clip, modality=modality, frame_number=fn)
                 for fn in frame_numbers
             ]
             if pool is None:
@@ -1501,7 +1685,13 @@ class CorridorKeyWebSequenceDataset(Dataset):
             )
         for modality in self.modalities:
             sample[modality] = decoded[modality]
-        sample.update(self._load_global_modalities_webdataset(clip=clip, frame_numbers=frame_numbers))
+        sample.update(
+            self._load_global_modalities_webdataset(
+                clip=clip,
+                frame_numbers=frame_numbers,
+                tile_grid=tile_grid,
+            )
+        )
 
         if self.transform is not None:
             sample = self.transform(sample)
