@@ -14,13 +14,13 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, BinaryIO, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, BinaryIO, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 import OpenEXR  # type: ignore[import-not-found]
 import torch
 from torch import Tensor
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 
 DEFAULT_MODALITIES: Tuple[str, ...] = ("Input", "FG", "BG", "Alpha")
@@ -43,6 +43,24 @@ class WebClipIndex:
     shard_index: int
     frame_numbers: Tuple[int, ...]
     modalities: Tuple[str, ...] = field(default_factory=tuple)
+
+
+
+@dataclass(frozen=True, slots=True)
+class TemporalChunkSpec:
+    """Index payload used by TemporalChunkBatchSampler."""
+
+    sample_index: int
+    frame_numbers: Tuple[int, ...]
+    chunk_start: int
+    chunk_end: int
+    chunk_index: int
+    num_chunks: int
+    logical_batch_index: int
+    tile_grid: Optional[Tuple[int, int, int, int]]
+    tile_coords: Tuple[float, float, float, float]
+    source_hw: Tuple[float, float]
+    tile_grid_tensor: Tuple[int, int, int, int]
 
 
 ClipIndex = WebClipIndex
@@ -160,7 +178,9 @@ def _sample_tile_selection(
     source_hw: Tuple[int, int],
     tile_size: int,
     local_tile_span: int,
+    rng: Optional[random.Random] = None,
 ) -> Tuple[Optional[Tuple[int, int, int, int]], Tensor, Tensor, Tensor]:
+    r = rng if rng is not None else random
     source_h, source_w = source_hw
     source_hw_t = torch.tensor([float(source_h), float(source_w)], dtype=torch.float32)
     if decode_full_frame:
@@ -177,8 +197,8 @@ def _sample_tile_selection(
     tiles_x = max(1, int(math.ceil(source_w / tile)))
     span_y = min(span, tiles_y)
     span_x = min(span, tiles_x)
-    tx0 = random.randint(0, max(0, tiles_x - span_x))
-    ty0 = random.randint(0, max(0, tiles_y - span_y))
+    tx0 = r.randint(0, max(0, tiles_x - span_x))
+    ty0 = r.randint(0, max(0, tiles_y - span_y))
     tx1 = tx0 + span_x - 1
     ty1 = ty0 + span_y - 1
     y0 = ty0 * tile
@@ -954,7 +974,12 @@ class CorridorKeyWebSequenceDataset(Dataset):
             out[out_name] = torch.stack([frame for frame in frames if frame is not None], dim=0)
         return out
 
-    def _sample_frame_numbers_for_index(self, index: int) -> Tuple[WebClipIndex, List[int]]:
+    def _sample_frame_numbers_for_index(
+        self,
+        index: int,
+        rng: Optional[random.Random] = None,
+    ) -> Tuple[WebClipIndex, List[int]]:
+        r = rng if rng is not None else random
         clip_idx, start = self.samples[index]
         clip = self.clips[clip_idx]
         all_positions = [start + (i * self.frame_stride) for i in range(self.sequence_length)]
@@ -962,8 +987,8 @@ class CorridorKeyWebSequenceDataset(Dataset):
             lo, hi = self.clip_len_range
             lo, hi = min(int(lo), int(hi)), max(int(lo), int(hi))
             n = len(all_positions)
-            clip_len = random.randint(max(1, min(lo, n)), max(1, min(hi, n)))
-            sub_start = random.randint(0, max(0, n - clip_len))
+            clip_len = r.randint(max(1, min(lo, n)), max(1, min(hi, n)))
+            sub_start = r.randint(0, max(0, n - clip_len))
             positions = all_positions[sub_start : sub_start + clip_len]
         else:
             positions = all_positions
@@ -1032,8 +1057,14 @@ class CorridorKeyWebSequenceDataset(Dataset):
             f"global_context_long_side={self.global_context_long_side}."
         )
 
-    def _getitem_cached_four_quadrants(self, index: int) -> Dict[str, object]:
-        clip, frame_numbers = self._sample_frame_numbers_for_index(index)
+    def _getitem_cached_four_quadrants(
+        self,
+        index: int,
+        frame_numbers: Optional[Sequence[int]] = None,
+    ) -> Dict[str, object]:
+        clip, sampled_frame_numbers = self._sample_frame_numbers_for_index(index)
+        if frame_numbers is None:
+            frame_numbers = sampled_frame_numbers
         grids = self._four_quadrant_tile_grids()
         local_fields_by_name = {
             out_name: field
@@ -1095,7 +1126,63 @@ class CorridorKeyWebSequenceDataset(Dataset):
             prebatched.append(sample)
         return {"_prebatched_samples": prebatched}
 
-    def __getitem__(self, index: int) -> Dict[str, object]:
+    def _temporal_stream_metadata(self, spec: TemporalChunkSpec) -> Dict[str, object]:
+        return {
+            "temporal_stream_chunk_index": int(spec.chunk_index),
+            "temporal_stream_num_chunks": int(spec.num_chunks),
+            "temporal_stream_full_frames": int(len(spec.frame_numbers)),
+            "temporal_stream_chunk_start": int(spec.chunk_start),
+            "temporal_stream_chunk_end": int(spec.chunk_end),
+            "temporal_stream_logical_batch": int(spec.logical_batch_index),
+        }
+
+    def _attach_temporal_stream_metadata(
+        self,
+        sample: Dict[str, object],
+        spec: TemporalChunkSpec,
+    ) -> Dict[str, object]:
+        metadata = self._temporal_stream_metadata(spec)
+        prebatched = sample.get("_prebatched_samples")
+        if isinstance(prebatched, list):
+            for item in prebatched:
+                if isinstance(item, dict):
+                    item.update(metadata)
+            return sample
+        sample.update(metadata)
+        return sample
+
+    def _getitem_temporal_chunk(self, spec: TemporalChunkSpec) -> Dict[str, object]:
+        clip_idx, _ = self.samples[int(spec.sample_index)]
+        clip = self.clips[clip_idx]
+        frame_numbers = list(spec.frame_numbers[spec.chunk_start : spec.chunk_end])
+        if not frame_numbers:
+            raise IndexError(f"Empty temporal chunk spec: {spec!r}")
+
+        if self.cached_four_quadrant_batch:
+            sample = self._getitem_cached_four_quadrants(int(spec.sample_index), frame_numbers=frame_numbers)
+            return self._attach_temporal_stream_metadata(sample, spec)
+
+        tile_grid = spec.tile_grid
+        tile_coords = torch.tensor(spec.tile_coords, dtype=torch.float32)
+        source_hw = torch.tensor(spec.source_hw, dtype=torch.float32)
+        tile_grid_t = torch.tensor(spec.tile_grid_tensor, dtype=torch.long)
+        sample: Dict[str, object] = {
+            "clip_name": clip.name,
+            "frame_numbers": torch.tensor(frame_numbers, dtype=torch.long),
+        }
+        if self.emit_tile_metadata:
+            sample["tile_coords"] = tile_coords
+            sample["source_hw"] = source_hw
+            sample["tile_grid"] = tile_grid_t
+        sample.update(self._load_all_modalities(clip, frame_numbers, tile_grid))
+        sample.update(self._load_global_modalities(clip, frame_numbers, tile_grid))
+        if self.transform is not None:
+            sample = self.transform(sample)
+        return self._attach_temporal_stream_metadata(sample, spec)
+
+    def __getitem__(self, index: int | TemporalChunkSpec) -> Dict[str, object]:
+        if isinstance(index, TemporalChunkSpec):
+            return self._getitem_temporal_chunk(index)
         if self.cached_four_quadrant_batch:
             return self._getitem_cached_four_quadrants(index)
         clip, frame_numbers = self._sample_frame_numbers_for_index(index)
@@ -1143,6 +1230,112 @@ def _make_worker_init(num_torch_threads: int, exr_internal_threads: int = 0) -> 
     return _init
 
 
+
+class TemporalChunkBatchSampler(Sampler[List[TemporalChunkSpec]]):
+    """Yield consecutive temporal chunk batches for each logical batch."""
+
+    def __init__(
+        self,
+        dataset: CorridorKeyWebSequenceDataset,
+        batch_size: int,
+        chunk_size: int,
+        *,
+        shuffle: bool = True,
+        drop_last: bool = False,
+        seed: int = 1337,
+    ) -> None:
+        if batch_size < 1:
+            raise ValueError("batch_size must be >= 1")
+        if chunk_size < 1:
+            raise ValueError("temporal stream chunk_size must be >= 1")
+        self.dataset = dataset
+        self.batch_size = int(batch_size)
+        self.chunk_size = int(chunk_size)
+        self.shuffle = bool(shuffle)
+        self.drop_last = bool(drop_last)
+        self.seed = int(seed)
+        self.epoch = 0
+
+    @property
+    def logical_len(self) -> int:
+        n = len(self.dataset)
+        if self.drop_last:
+            return n // self.batch_size
+        return int(math.ceil(n / self.batch_size))
+
+    def __len__(self) -> int:
+        if self.dataset.clip_len_range is not None:
+            _, max_len = self.dataset.clip_len_range
+            full_len = min(int(max_len), int(self.dataset.sequence_length))
+        else:
+            full_len = int(self.dataset.sequence_length)
+        chunks = max(1, int(math.ceil(max(1, full_len) / self.chunk_size)))
+        return self.logical_len * chunks
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __iter__(self) -> Iterator[List[TemporalChunkSpec]]:
+        rng = random.Random(self.seed + self.epoch)
+        indices = list(range(len(self.dataset)))
+        if self.shuffle:
+            rng.shuffle(indices)
+
+        for logical_batch_idx in range(self.logical_len):
+            start = logical_batch_idx * self.batch_size
+            sample_indices = indices[start : start + self.batch_size]
+            if self.drop_last and len(sample_indices) < self.batch_size:
+                continue
+
+            planned: List[Tuple[int, Tuple[int, ...], Optional[Tuple[int, int, int, int]], Tuple[float, float, float, float], Tuple[float, float], Tuple[int, int, int, int]]] = []
+            max_frames = 0
+            for sample_index in sample_indices:
+                _, frame_numbers_l = self.dataset._sample_frame_numbers_for_index(sample_index, rng=rng)
+                frame_numbers = tuple(int(v) for v in frame_numbers_l)
+                tile_grid, tile_coords, source_hw, tile_grid_t = _sample_tile_selection(
+                    decode_full_frame=self.dataset.decode_full_frame,
+                    source_hw=self.dataset.source_hw,
+                    tile_size=self.dataset.exr_tile_size,
+                    local_tile_span=self.dataset.local_tile_span,
+                    rng=rng,
+                )
+                planned.append((
+                    int(sample_index),
+                    frame_numbers,
+                    tile_grid,
+                    tuple(float(v) for v in tile_coords.tolist()),
+                    tuple(float(v) for v in source_hw.tolist()),
+                    tuple(int(v) for v in tile_grid_t.tolist()),
+                ))
+                max_frames = max(max_frames, len(frame_numbers))
+
+            num_chunks = max(1, int(math.ceil(max_frames / self.chunk_size)))
+            for chunk_idx in range(num_chunks):
+                chunk_start = chunk_idx * self.chunk_size
+                chunk_end = min(max_frames, chunk_start + self.chunk_size)
+                chunk_specs: List[TemporalChunkSpec] = []
+                for sample_index, frame_numbers, tile_grid, tile_coords, source_hw, tile_grid_t in planned:
+                    if chunk_start >= len(frame_numbers):
+                        continue
+                    chunk_specs.append(
+                        TemporalChunkSpec(
+                            sample_index=sample_index,
+                            frame_numbers=frame_numbers,
+                            chunk_start=chunk_start,
+                            chunk_end=min(len(frame_numbers), chunk_end),
+                            chunk_index=chunk_idx,
+                            num_chunks=num_chunks,
+                            logical_batch_index=logical_batch_idx,
+                            tile_grid=tile_grid,
+                            tile_coords=tile_coords,
+                            source_hw=source_hw,
+                            tile_grid_tensor=tile_grid_t,
+                        )
+                    )
+                if chunk_specs:
+                    yield chunk_specs
+
+
 seed_worker = _make_worker_init(1)
 
 
@@ -1159,28 +1352,51 @@ def create_single_gpu_dataloader(
     collate_fn: Optional[Callable] = None,
     num_torch_threads: int = 1,
     exr_internal_threads: int = 0,
+    temporal_stream_chunk_size: int = 0,
     **_unused: object,
 ) -> DataLoader:
     if batch_size < 1:
         raise ValueError("batch_size must be >= 1")
-    generator = torch.Generator()
-    generator.manual_seed(int(seed))
+    stream_chunk_size = max(0, int(temporal_stream_chunk_size))
     loader_kwargs: Dict[str, Any] = {
         "dataset": dataset,
-        "batch_size": int(batch_size),
-        "shuffle": bool(shuffle),
         "num_workers": int(num_workers),
         "pin_memory": bool(pin_memory),
-        "drop_last": bool(drop_last),
         "worker_init_fn": _make_worker_init(num_torch_threads, exr_internal_threads=exr_internal_threads),
-        "generator": generator,
         "collate_fn": collate_fn,
     }
+    if stream_chunk_size > 0:
+        if not isinstance(dataset, CorridorKeyWebSequenceDataset):
+            raise TypeError("temporal streaming requires CorridorKeyWebSequenceDataset")
+        batch_sampler = TemporalChunkBatchSampler(
+            dataset=dataset,
+            batch_size=int(batch_size),
+            chunk_size=stream_chunk_size,
+            shuffle=bool(shuffle),
+            drop_last=bool(drop_last),
+            seed=int(seed),
+        )
+        loader_kwargs["batch_sampler"] = batch_sampler
+    else:
+        generator = torch.Generator()
+        generator.manual_seed(int(seed))
+        loader_kwargs.update({
+            "batch_size": int(batch_size),
+            "shuffle": bool(shuffle),
+            "drop_last": bool(drop_last),
+            "generator": generator,
+        })
     if int(num_workers) > 0:
         loader_kwargs["persistent_workers"] = bool(persistent_workers)
         loader_kwargs["prefetch_factor"] = max(1, int(prefetch_factor))
-    return DataLoader(**loader_kwargs)
+    loader = DataLoader(**loader_kwargs)
+    if stream_chunk_size > 0:
+        setattr(loader, "_corridorkey_temporal_stream", True)
+        setattr(loader, "_corridorkey_logical_len", batch_sampler.logical_len)
+    return loader
 
 
 def set_dataloader_epoch(dataloader: DataLoader, epoch: int) -> None:
-    del dataloader, epoch
+    batch_sampler = getattr(dataloader, "batch_sampler", None)
+    if batch_sampler is not None and hasattr(batch_sampler, "set_epoch"):
+        batch_sampler.set_epoch(epoch)

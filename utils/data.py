@@ -373,6 +373,7 @@ class CorridorMattingTransform:
     green_foreground_strength_max: float = 1.0
     temporal_jitter_p: float = 0.1
     skip_temporal_sample: bool = False
+    disable_temporal_augment: bool = False
     fg_representation: str = "premul"
 
     # When ``True``, ``__call__`` exits after the channel/dtype normalisation
@@ -553,7 +554,9 @@ class CorridorMattingTransform:
             temporal_names.append("global_alpha")
             temporal_tensors.append(global_alpha_gt)
 
-        if self.skip_temporal_sample:
+        if self.disable_temporal_augment:
+            temporal_tensors = list(temporal_tensors)
+        elif self.skip_temporal_sample:
             temporal_tensors = self._temporal_augment(temporal_tensors)
         else:
             temporal_tensors = self._temporal_sample(temporal_tensors)
@@ -944,6 +947,10 @@ def pad_collate_video(batch: List[Dict[str, object]], pad_multiple: int = 8) -> 
             meta = item.get(meta_key)
             if isinstance(meta, Tensor):
                 out[meta_key] = meta.unsqueeze(0)
+        for meta_key in ("temporal_stream_chunk_index", "temporal_stream_num_chunks", "temporal_stream_full_frames", "temporal_stream_chunk_start", "temporal_stream_chunk_end", "temporal_stream_logical_batch"):
+            meta = item.get(meta_key)
+            if meta is not None:
+                out[meta_key] = torch.tensor([int(meta)], dtype=torch.long)
         return out
 
     # ---- General slow path: stack into a padded destination ---------------
@@ -1049,4 +1056,9 @@ def pad_collate_video(batch: List[Dict[str, object]], pad_multiple: int = 8) -> 
         metas = [item.get(meta_key) for item in batch]
         if all(isinstance(m, Tensor) for m in metas):
             out[meta_key] = torch.stack([m for m in metas if isinstance(m, Tensor)], dim=0)
+
+    for meta_key in ("temporal_stream_chunk_index", "temporal_stream_num_chunks", "temporal_stream_full_frames", "temporal_stream_chunk_start", "temporal_stream_chunk_end", "temporal_stream_logical_batch"):
+        metas = [item.get(meta_key) for item in batch]
+        if all(m is not None for m in metas):
+            out[meta_key] = torch.tensor([int(m) for m in metas], dtype=torch.long, device=device)
     return out

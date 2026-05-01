@@ -985,6 +985,13 @@ def build_dataloader(config: Dict[str, Any]) -> DataLoader:
 
     clip_len_min = int(data_cfg.get("clip_len_min", 4))
     clip_len_max = int(data_cfg.get("clip_len_max", 12))
+    stream_temporal_batches = bool(data_cfg.get("stream_temporal_batches", False))
+    temporal_stream_chunk_size = int(
+        data_cfg.get(
+            "temporal_stream_chunk_size",
+            config.get("train", {}).get("temporal_batch_size", clip_len_max),
+        )
+    )
 
     modalities_cfg = data_cfg.get("modalities", ["Input", "FG", "BG", "Alpha"])
     if isinstance(modalities_cfg, str):
@@ -1021,6 +1028,15 @@ def build_dataloader(config: Dict[str, Any]) -> DataLoader:
     # right setting whenever the dataloader workers are the bottleneck and
     # the GPU has spare VRAM/SMs -- see ``utils/device_transform.py``.
     device_offload = bool(data_cfg.get("device_augment", False))
+    if stream_temporal_batches:
+        if temporal_stream_chunk_size < 1:
+            raise ValueError("data.temporal_stream_chunk_size must be >= 1 when streaming is enabled")
+        if not device_offload:
+            raise ValueError("data.stream_temporal_batches requires data.device_augment=true")
+        if clip_len_min != clip_len_max:
+            raise ValueError("data.stream_temporal_batches currently requires clip_len_min == clip_len_max")
+        if float(data_cfg.get("temporal_jitter_p", 0.1)) != 0.0:
+            raise ValueError("data.stream_temporal_batches currently requires temporal_jitter_p: 0.0")
 
     # Optional dtype downcast for the device-offload H2D path. Accepts
     # "float32" / "bfloat16" / "float16" (and the usual aliases). When set
@@ -1051,6 +1067,7 @@ def build_dataloader(config: Dict[str, Any]) -> DataLoader:
         green_foreground_strength_max=float(data_cfg.get("green_foreground_strength_max", 1.0)),
         temporal_jitter_p=float(data_cfg.get("temporal_jitter_p", 0.1)),
         skip_temporal_sample=True,
+        disable_temporal_augment=stream_temporal_batches,
         device_offload=device_offload,
         # Photometric: subject / background gain.
         subject_gain_min=float(data_cfg.get("subject_gain_min", 0.7)),
@@ -1184,9 +1201,14 @@ def build_dataloader(config: Dict[str, Any]) -> DataLoader:
         collate_fn=collate_fn,
         num_torch_threads=int(data_cfg.get("num_torch_threads", 1)),
         exr_internal_threads=int(data_cfg.get("exr_internal_threads", 0)),
+        temporal_stream_chunk_size=temporal_stream_chunk_size if stream_temporal_batches else 0,
     )
 
     setattr(loader, "_corridorkey_set_dataloader_epoch", dataset_runtime.set_dataloader_epoch)
+    if stream_temporal_batches:
+        setattr(loader, "_corridorkey_temporal_stream", True)
+        logical_len = getattr(getattr(loader, "batch_sampler", None), "logical_len", len(loader))
+        setattr(loader, "_corridorkey_logical_len", int(logical_len))
 
     if debug_console:
         print(
@@ -1351,7 +1373,9 @@ def train() -> None:
 
     grad_accum_steps = int(train_cfg.get("grad_accum_steps", 1))
     temporal_batch_size = int(train_cfg.get("temporal_batch_size", 0))
-    epoch_steps = math.ceil(len(dataloader) / max(1, grad_accum_steps))
+    dataloader_iter_len = len(dataloader)
+    dataloader_logical_len = int(getattr(dataloader, "_corridorkey_logical_len", dataloader_iter_len))
+    epoch_steps = math.ceil(dataloader_logical_len / max(1, grad_accum_steps))
     epochs_total_steps = int(train_cfg.get("epochs", 40)) * epoch_steps
     # Optional hard cap on optimizer steps. Useful for short smoke runs where
     # we want a real save artefact without grinding through a whole epoch.
@@ -1385,7 +1409,8 @@ def train() -> None:
     )
     _maybe_print(
         debug_console_enabled,
-        f"Step accounting: dataloader_iters_per_epoch={len(dataloader)}, "
+        f"Step accounting: dataloader_iters_per_epoch={dataloader_iter_len}, "
+        f"logical_batches_per_epoch={dataloader_logical_len}, "
         f"grad_accum_steps={grad_accum_steps}, optimizer_steps_per_epoch={epoch_steps}",
     )
     if max_epoch_batches > 0:
@@ -1653,13 +1678,17 @@ def train() -> None:
 
             running_loss = torch.zeros((), device=device, dtype=torch.float32)
             pbar = tqdm(
-                total=len(dataloader),
+                total=dataloader_iter_len,
                 desc=f"Epoch {epoch + 1}/{epochs}",
                 dynamic_ncols=True,
                 leave=True,
             )
 
             prefetch_device_transform = device_transform if cuda_prefetch else None
+            stream_coarse_seed: torch.Tensor | None = None
+            stream_current_logical_batch: int | None = None
+            stream_total_loss: torch.Tensor | None = None
+            stream_loss_items: Dict[str, torch.Tensor] = {}
 
             for it, batch in enumerate(
                 iterate_device_batches(
@@ -1684,25 +1713,55 @@ def train() -> None:
                         with torch.no_grad():
                             batch = device_transform(batch)
 
-                temporal_chunks = build_temporal_chunks(
-                    total_frames=int(batch["video_rgb"].shape[1]),
-                    chunk_size=temporal_batch_size,
-                )
-                real_n_chunks = len(temporal_chunks)
-                while len(temporal_chunks) < fixed_n_chunks:
-                    temporal_chunks.append(temporal_chunks[-1])
+                is_stream_batch = "temporal_stream_chunk_index" in batch
+                logical_it = it
+                stream_is_final_chunk = True
+                if is_stream_batch:
+                    logical_it = int(batch["temporal_stream_logical_batch"][0].detach().to(device="cpu"))
+                    stream_chunk_idx = int(batch["temporal_stream_chunk_index"][0].detach().to(device="cpu"))
+                    stream_num_chunks = int(batch["temporal_stream_num_chunks"][0].detach().to(device="cpu"))
+                    stream_is_final_chunk = stream_chunk_idx + 1 >= stream_num_chunks
+                    if stream_current_logical_batch != logical_it or stream_chunk_idx == 0:
+                        stream_current_logical_batch = logical_it
+                        stream_coarse_seed = batch["coarse_alpha_init"]
+                        stream_total_loss = batch["video_rgb"].new_tensor(0.0)
+                        stream_loss_items = {}
+                    elif stream_coarse_seed is not None:
+                        batch["coarse_alpha_init"] = stream_coarse_seed
+                    temporal_chunks = [(0, int(batch["video_rgb"].shape[1]))]
+                    real_n_chunks = 1
+                else:
+                    temporal_chunks = build_temporal_chunks(
+                        total_frames=int(batch["video_rgb"].shape[1]),
+                        chunk_size=temporal_batch_size,
+                    )
+                    real_n_chunks = len(temporal_chunks)
+                    while len(temporal_chunks) < fixed_n_chunks:
+                        temporal_chunks.append(temporal_chunks[-1])
 
                 valid_mask = batch.get("valid_mask")
                 if valid_mask is not None:
-                    total_weight_denom = valid_mask.sum().clamp_min(1.0)
+                    if is_stream_batch:
+                        total_weight_denom = batch["temporal_stream_full_frames"].sum().clamp_min(1).to(
+                            dtype=batch["video_rgb"].dtype
+                        )
+                    else:
+                        total_weight_denom = valid_mask.sum().clamp_min(1.0)
+                elif is_stream_batch:
+                    total_weight_denom = batch["temporal_stream_full_frames"].sum().clamp_min(1).to(
+                        dtype=batch["video_rgb"].dtype
+                    )
                 else:
                     total_weight_denom = batch["video_rgb"].new_tensor(float(batch["video_rgb"].shape[1]))
 
                 coarse_seed = batch["coarse_alpha_init"]
                 did_backward = False
-                batch_total_loss = batch["video_rgb"].new_tensor(0.0)
-                batch_loss_items: Dict[str, torch.Tensor] = {}
-                do_step = ((it + 1) % grad_accum_steps == 0) or (it + 1 == len(dataloader))
+                batch_total_loss = stream_total_loss if is_stream_batch and stream_total_loss is not None else batch["video_rgb"].new_tensor(0.0)
+                batch_loss_items = stream_loss_items if is_stream_batch else {}
+                do_step = stream_is_final_chunk and (
+                    ((logical_it + 1) % grad_accum_steps == 0)
+                    or (logical_it + 1 == dataloader_logical_len)
+                )
 
                 for chunk_idx, (start_t, end_t) in enumerate(temporal_chunks):
                     is_padding_chunk = chunk_idx >= real_n_chunks
@@ -1720,9 +1779,15 @@ def train() -> None:
                                 dtype=batch["video_rgb"].dtype
                             )
                         else:
-                            chunk_weight = batch["video_rgb"].new_tensor(
-                                (end_t - start_t) / max(1, int(batch["video_rgb"].shape[1]))
-                            )
+                            if is_stream_batch:
+                                chunk_weight = (
+                                    batch["video_rgb"].new_tensor(float(batch["video_rgb"].shape[0] * (end_t - start_t)))
+                                    / total_weight_denom
+                                ).to(dtype=batch["video_rgb"].dtype)
+                            else:
+                                chunk_weight = batch["video_rgb"].new_tensor(
+                                    (end_t - start_t) / max(1, int(batch["video_rgb"].shape[1]))
+                                )
 
                     offload_context = (
                         torch.autograd.graph.save_on_cpu(pin_memory=activation_offload_pin_memory)
@@ -1774,6 +1839,11 @@ def train() -> None:
                                 batch_loss_items[k] = v_detached
 
                         coarse_seed = pred["alpha_pred"][:, -1].detach()
+
+                if is_stream_batch:
+                    stream_coarse_seed = coarse_seed
+                    stream_total_loss = batch_total_loss.detach()
+                    stream_loss_items = batch_loss_items
 
                 if do_step and did_backward:
                     if grad_clip > 0:
@@ -1838,14 +1908,19 @@ def train() -> None:
                 elif do_step:
                     optimizer.zero_grad(set_to_none=True)
 
-                should_log = (it + 1) % log_interval == 0
-                should_wandb_log = wandb_logger.enabled and (global_step % wandb_log_interval == 0)
+                should_log = stream_is_final_chunk and ((logical_it + 1) % log_interval == 0)
+                should_wandb_log = (
+                    stream_is_final_chunk
+                    and wandb_logger.enabled
+                    and (global_step % wandb_log_interval == 0)
+                )
                 if args.profile and not profile_log_metrics:
                     should_log = False
                     should_wandb_log = False
                 should_metric_log = should_log or should_wandb_log
 
-                running_loss = running_loss + batch_total_loss.detach().to(dtype=torch.float32)
+                if stream_is_final_chunk:
+                    running_loss = running_loss + batch_total_loss.detach().to(dtype=torch.float32)
 
                 pbar_needs_loss = show_loss_in_pbar and should_log
                 loss_for_bar = batch_total_loss.detach() if pbar_needs_loss else None
@@ -1875,7 +1950,7 @@ def train() -> None:
                     if should_log:
                         reduced_items_str = " ".join(f"{k}={v:.4f}" for k, v in reduced_items.items())
                         tqdm.write(
-                            f"epoch={epoch:03d} iter={it + 1:05d}/{len(dataloader):05d} "
+                            f"epoch={epoch:03d} iter={logical_it + 1:05d}/{dataloader_logical_len:05d} "
                             f"step={global_step:06d} lr={lr:.2e} {reduced_items_str}"
                         )
                     if should_wandb_log:
@@ -1892,7 +1967,7 @@ def train() -> None:
                                 "train/loss_ema": wandb_loss_ema,
                                 "train/lr": float(lr),
                                 "train/epoch": int(epoch),
-                                "train/iter": int(it + 1),
+                                "train/iter": int(logical_it + 1),
                                 **{f"train/{k}": v for k, v in reduced_items.items()},
                             },
                             step=global_step,
@@ -1937,9 +2012,9 @@ def train() -> None:
                     profile_finished = True
                     break
 
-                if max_epoch_batches > 0 and it + 1 >= max_epoch_batches:
+                if max_epoch_batches > 0 and stream_is_final_chunk and logical_it + 1 >= max_epoch_batches:
                     tqdm.write(
-                        f"Reached max_epoch_batches={max_epoch_batches} at epoch iter={it + 1}; "
+                        f"Reached max_epoch_batches={max_epoch_batches} at epoch iter={logical_it + 1}; "
                         "ending epoch early."
                     )
                     break
@@ -1986,7 +2061,7 @@ def train() -> None:
 
                 _save_epoch_checkpoint()
 
-            epoch_loss = running_loss / max(1, len(dataloader))
+            epoch_loss = running_loss / max(1, dataloader_logical_len)
             epoch_loss_value = float(epoch_loss.detach().to(device="cpu"))
             tqdm.write(f"[epoch {epoch:03d}] avg_total_loss={epoch_loss_value:.6f}")
             wandb_logger.log(

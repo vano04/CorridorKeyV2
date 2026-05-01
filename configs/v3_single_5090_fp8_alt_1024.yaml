@@ -67,6 +67,8 @@ data:
   root_dir: "CorridorKeyDataset"
   modalities: [FG, BG, Alpha]
   multi_resolution_buckets: [384, 512]
+  stream_temporal_batches: true
+  temporal_stream_chunk_size: 4
   batch_size: 2
   clip_len_min: 8
   clip_len_max: 8
