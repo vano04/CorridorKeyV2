@@ -50,8 +50,8 @@ def test_output_shapes(model, device, h, w):
     B, T = 1, 4
     video = torch.randn(B, T, 3, h, w, device=device)
     coarse = torch.rand(B, 1, h, w, device=device)
-    global_video = torch.randn(B, T, 3, h, w, device=device)
-    global_coarse = torch.rand(B, 1, h, w, device=device)
+    global_video = torch.randn(B, T, 3, h // 2, w // 2, device=device)
+    global_coarse = torch.rand(B, 1, h // 2, w // 2, device=device)
 
     model.eval()
     with torch.no_grad():
@@ -86,6 +86,35 @@ def test_no_quality_eval_at_inference(model, device):
     with torch.no_grad():
         out = model(video=video, coarse_alpha_init=coarse)
     assert "quality_eval_pred" not in out
+
+
+def test_input_residual_fg_mode_uses_native_input_base(device):
+    config = {
+        "patch_size": 8,
+        "embed_dims": [32, 48, 64, 80],
+        "depths": [1, 1, 1, 1],
+        "num_heads": [1, 2, 4, 4],
+        "window_sizes": [4, 4, 4, 4],
+        "decoder_out_dim": 32,
+        "global_context_dim": 32,
+        "global_context_layers": 1,
+        "global_context_heads": 1,
+        "global_context_tokens": 4,
+        "use_reference_memory": False,
+        "use_native_refiner": False,
+        "predict_fg": True,
+        "fg_prediction_mode": "input_residual",
+    }
+    m = build_v3_hybrid_video_matting_model(config).to(device).eval()
+    video = torch.rand(1, 2, 3, 64, 64, device=device)
+    coarse = torch.rand(1, 1, 64, 64, device=device)
+
+    with torch.no_grad():
+        out = m(video=video, coarse_alpha_init=coarse)
+
+    assert "decoder_fg_pred" in out
+    assert "input_fg_base_pred" in out
+    assert torch.allclose(out["fg_pred"], out["input_fg_base_pred"], atol=1e-6)
 
 
 def test_quality_eval_at_train(model, device):

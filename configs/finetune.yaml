@@ -1,0 +1,180 @@
+# Alpha-first finetune config.
+#
+# Derived from v3_single_5090_fp8_alt_1024.yaml for continuing from existing
+# checkpoints while shifting foreground handling away from low-res decoder FG.
+# The fg_head module remains enabled for checkpoint compatibility, but
+# fg_prediction_mode=input_residual makes the active FG path:
+#   input_rgb * alpha_pred + native RGB residual/despill correction.
+
+model:
+  patch_size: 8
+  embed_dims: [128, 256, 384, 512]
+  depths: [2, 2, 6, 2]
+  num_heads: [4, 8, 12, 16]
+  window_sizes: [8, 8, 4, 4]
+  memory_tokens: 64
+  temporal_window: 5
+  drop_path_rate: 0.1
+  gradient_checkpointing: true
+  decoder_out_dim: 256
+
+  use_green_priors: true
+  use_coordinate_channels: true
+  use_unknown_band: true
+  guidance_presence_flag: true
+  green_prior_dropout: 0.10
+  coarse_alpha_drop_prob: 0.05
+  predict_fg: true
+  fg_prediction_mode: input_residual
+  predict_uncertainty: true
+  predict_spill_mask: true
+  predict_quality_eval: true
+  fg_representation: premul
+
+  global_context_dim: 256
+  global_context_layers: 4
+  global_context_heads: 8
+  global_context_tokens: 64
+  # Kept true for checkpoint shape compatibility. This finetune omits global
+  # FG sidecars below, so the channel is zero/pseudo-guided rather than GT FG.
+  use_global_fg_guidance: true
+
+  use_reference_memory: true
+  reference_tokens_per_frame: 32
+  num_reference_frames: 2
+  reference_dropout: 0.25
+
+  use_native_refiner: true
+  native_refiner_blocks: 2
+  native_refiner_hidden: 48
+  native_refiner_chunk_frames: 1
+  native_refiner_max_alpha_delta: 0.03
+  native_refiner_max_fg_delta: 0.20
+  native_refiner_max_spill_delta: 0.20
+
+  fp8:
+    enabled: false
+    backend: transformer_engine
+    use_te_linear: true
+    use_te_attention: true
+    exclude_heads: true
+    exclude_native_refiner: true
+    fp8_recipe: delayed_scaling
+
+data:
+  dataset: local
+  root_dir: "CorridorKeyDataset"
+  modalities: [FG, BG, Alpha]
+  multi_resolution_buckets: [384, 512]
+  stream_temporal_batches: true
+  temporal_stream_chunk_size: 4
+  batch_size: 2
+  clip_len_min: 8
+  clip_len_max: 8
+  fixed_crop_size: 512
+  fg_representation: premul
+  device_augment: true
+  host_dtype: fp16
+  read_dtype: fp16
+  num_torch_threads: 4
+  horizontal_flip_p: 0.5
+  temporal_jitter_p: 0.0
+  background_replace_p: 0.3
+  spill_augment_p: 0.4
+
+  # Teach "green can be foreground" explicitly.
+  green_foreground_prob: 0.25
+  green_foreground_strength_min: 0.15
+  green_foreground_strength_max: 0.55
+  green_foreground_alpha_thresh: 0.75
+  coarse_alpha_drop_prob: 0.05
+  grayscale_augment_p: 0.20
+
+  decode_full_frame: false
+  emit_global_context: true
+  global_context_long_side: 1024
+  exr_tile_size: 256
+  local_tile_span: 4
+  source_hw: [2048, 2048]
+  exr_internal_threads: 0
+  exr_decode_threads: 8
+  emit_tile_metadata: true
+  decode_global_context: true
+  cached_four_quadrant_batch: true
+  # Input+Alpha are enough for global context in the alpha-first regime; GT FG
+  # guidance would make eval/train easier than inference.
+  global_context_modalities: [Input, Alpha]
+  num_workers: 24
+  prefetch_factor: 2
+  persistent_workers: true
+  pin_memory: true
+
+train:
+  epochs: 12
+  lr: 2.0e-6
+  weight_decay: 0.01
+  warmup_steps: 100
+  min_lr_ratio: 0.1
+  amp: true
+  amp_dtype: bf16
+  grad_clip: 1.0
+  fused_adamw: true
+  log_interval: 20
+  save_interval: 1
+  inference_mode: hybrid
+  temporal_batch_size: 4
+  debug_console: true
+  grad_accum_steps: 1
+  rematerialize_activations: true
+  ema:
+    enabled: true
+    decay: 0.9999
+    update_after_step: 0
+    update_every: 1
+    device: model
+
+  compile: false
+  compile_dynamic: true
+  cuda_warmup: false
+  cuda_prefetch: true
+  cuda_prefetch_queue: 4
+  wandb:
+    enabled: true
+    entity: vanoinc
+    project: CorridorKeyV2
+    log_interval: 5
+    log_checkpoints: false
+
+loss:
+  alpha_l1: 1.25
+  alpha_laplacian: 1.25
+  fg_l1: 0.35
+  comp_l1: 1.25
+  alpha_band_l1: 0.75
+  alpha_band_laplacian: 0.75
+  temporal_alpha_gradient: 0.35
+  temporal_fg_gradient: 0.05
+  comp_random_bg: 0.5
+  spill_l1: 0.25
+  spill_transition_only: true
+  spill_transition_low: 0.02
+  spill_transition_high: 0.98
+  spill_exclude_opaque_fg: true
+  spill_opaque_alpha_thresh: 0.90
+
+  green_fg_alpha: 0.75
+  green_fg_color: 0.35
+  green_fg_alpha_thresh: 0.75
+  green_fg_margin: 0.08
+  green_fg_min_saturation: 0.10
+  green_bg_alpha_suppress: 0.25
+  green_bg_margin: 0.08
+  green_bg_alpha_thresh: 0.02
+  green_bg_min_saturation: 0.10
+
+  uncertainty: 0.1
+  coarse_alpha_l1: 0.5
+  coarse_fg_l1: 0.0
+  native_alpha_delta_reg: 0.05
+  native_fg_delta_reg: 0.02
+  quality_eval: 0.1

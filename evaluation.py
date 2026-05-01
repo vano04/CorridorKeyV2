@@ -124,12 +124,53 @@ def _resolve_amp_dtype(name: str) -> torch.dtype:
     return torch.float32
 
 
-def _load_v3_model(checkpoint_path: Path, cfg: Dict[str, Any], device: torch.device, checkpoint: Optional[Any] = None) -> torch.nn.Module:
+def _all_tensor_mapping(value: Any) -> bool:
+    return isinstance(value, dict) and bool(value) and all(torch.is_tensor(v) for v in value.values())
+
+
+def _ema_state_dict(checkpoint: Any) -> Optional[Dict[str, torch.Tensor]]:
+    if not isinstance(checkpoint, dict):
+        return None
+
+    value = checkpoint.get("model_ema_state_dict")
+    if _all_tensor_mapping(value):
+        return value
+
+    value = checkpoint.get("model_ema")
+    if _all_tensor_mapping(value):
+        return value
+    if isinstance(value, dict):
+        shadow = value.get("shadow")
+        if _all_tensor_mapping(shadow):
+            return shadow
+    return None
+
+
+def _checkpoint_state_dict_for_weights(checkpoint: Any, weights: str) -> Dict[str, torch.Tensor]:
+    key = str(weights).strip().lower()
+    if key in {"ema", "model_ema"}:
+        state_dict = _ema_state_dict(checkpoint)
+        if state_dict is None:
+            raise ValueError("Checkpoint does not contain EMA weights")
+        return state_dict
+    if key in {"model", "non_ema", "non-ema", "raw"}:
+        return _checkpoint_state_dict(checkpoint)
+    raise ValueError(f"Unsupported weights variant: {weights!r}")
+
+
+def _load_v3_model(
+    checkpoint_path: Path,
+    cfg: Dict[str, Any],
+    device: torch.device,
+    checkpoint: Optional[Any] = None,
+    *,
+    weights: str = "model",
+) -> torch.nn.Module:
     model_cfg = dict(cfg.get("model", {}))
     model = build_v3_hybrid_video_matting_model(model_cfg).to(device)
     if checkpoint is None:
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    state_dict = _normalize_compile_prefix_for_target(_checkpoint_state_dict(checkpoint), model)
+    state_dict = _normalize_compile_prefix_for_target(_checkpoint_state_dict_for_weights(checkpoint, weights), model)
     model.load_state_dict(state_dict, strict=True)
     model.eval()
     return model
@@ -156,7 +197,10 @@ def evaluate(
         if "global_input_gt" in batch:
             model_kwargs["global_video"] = batch["global_input_gt"]
         if "global_alpha_gt" in batch:
-            model_kwargs["global_coarse_alpha_init"] = batch["global_alpha_gt"]
+            global_alpha = batch["global_alpha_gt"]
+            if global_alpha.ndim == 5:
+                global_alpha = global_alpha[:, 0]
+            model_kwargs["global_coarse_alpha_init"] = global_alpha
         if "global_fg_gt" in batch:
             model_kwargs["global_fg_guidance"] = batch["global_fg_gt"]
         if "tile_coords" in batch:
@@ -200,6 +244,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=_HERE / "eval_output")
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--amp-dtype", default="bf16", choices=("bf16", "fp16", "fp32"))
+    parser.add_argument(
+        "--weights",
+        default="both",
+        choices=("model", "ema", "both"),
+        help="Evaluate raw model weights, EMA weights, or both when the checkpoint contains EMA.",
+    )
     return parser.parse_args(argv)
 
 
@@ -219,7 +269,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     print(f"[v3-eval] config: {cfg_source}", flush=True)
 
-    model = _load_v3_model(args.checkpoint, cfg, device, checkpoint=checkpoint)
     loss_cfg = cfg.get("loss", {})
     data_cfg = dict(cfg.get("data", {}))
 
@@ -287,24 +336,52 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         flush=True,
     )
 
-    metrics = evaluate(
-        model=model,
-        dataloader=dataloader,
-        loss_fn=loss_fn,
-        device=device,
-        amp=amp_enabled,
-        amp_dtype=amp_dtype,
-    )
+    has_ema = _ema_state_dict(checkpoint) is not None
+    if args.weights == "both":
+        variants = ["model", "ema"] if has_ema else ["model"]
+        if not has_ema:
+            print("[v3-eval] checkpoint has no EMA weights; evaluating model weights only", flush=True)
+    else:
+        variants = [str(args.weights)]
+        if args.weights == "ema" and not has_ema:
+            raise ValueError("Requested --weights=ema, but checkpoint does not contain EMA weights")
+
+    all_metrics: Dict[str, Dict[str, float]] = OrderedDict()
+    for variant in variants:
+        print(f"[v3-eval] evaluating weights={variant}", flush=True)
+        model = _load_v3_model(
+            args.checkpoint,
+            cfg,
+            device,
+            checkpoint=checkpoint,
+            weights=variant,
+        )
+        all_metrics[variant] = evaluate(
+            model=model,
+            dataloader=dataloader,
+            loss_fn=loss_fn,
+            device=device,
+            amp=amp_enabled,
+            amp_dtype=amp_dtype,
+        )
+        del model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = args.output_dir / "metrics.json"
     with metrics_path.open("w", encoding="utf-8") as handle:
-        json.dump(metrics, handle, indent=2, sort_keys=True)
+        json.dump(all_metrics, handle, indent=2, sort_keys=True)
         handle.write("\n")
 
     print(f"[v3-eval] metrics saved to {metrics_path}", flush=True)
-    for key in sorted(metrics):
-        print(f"[v3-eval] {key}={metrics[key]:.6f}", flush=True)
+    for variant, metrics in all_metrics.items():
+        variant_path = args.output_dir / f"metrics_{variant}.json"
+        with variant_path.open("w", encoding="utf-8") as handle:
+            json.dump(metrics, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        for key in sorted(metrics):
+            print(f"[v3-eval] {variant}/{key}={metrics[key]:.6f}", flush=True)
     return 0
 
 

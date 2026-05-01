@@ -13,10 +13,9 @@ Usage:
         --output-dir V3_output \
         --tile-size 1024 --temporal-frames 4
 
-The model's ``build_global_context`` method is expected to be adapted for V3
-inference. For now, V3 inference runs in the "no global context" fallback path
-unless ``--global-context`` is enabled and the checkpoint exposes
-``build_global_context()``.
+Global context is built from a resolution-agnostic square canvas. Non-square
+frames are scaled to fit and centered in the global window so wide/tall inputs
+keep the same spatial frame of reference as 1024x1024 training windows.
 """
 from __future__ import annotations
 
@@ -49,7 +48,6 @@ from Infer.inference import (
     _crop_alpha_tile,
     _default_alpha_dir,
     _default_input_dir,
-    _global_context_hw,
     _iter_window_tiles_sync,
     _normalize_compile_prefix_for_target,
     _read_alpha_tile,
@@ -73,6 +71,90 @@ from models.v3_hybrid_matting import V3InferenceOptions
 
 
 _EPS = 1e-6
+
+
+def _letterbox_chw_to_square(
+    tensor: Tensor,
+    side: int,
+    *,
+    fill: float = 0.0,
+    clamp: Optional[Tuple[float, float]] = None,
+) -> Tensor:
+    """Resize a CHW tensor to fit inside a centered square canvas."""
+    side = max(1, int(side))
+    h, w = int(tensor.shape[-2]), int(tensor.shape[-1])
+    if h <= 0 or w <= 0:
+        raise ValueError(f"Cannot letterbox tensor with invalid shape {tuple(tensor.shape)}")
+
+    scale = min(side / float(h), side / float(w))
+    out_h = max(1, min(side, int(round(h * scale))))
+    out_w = max(1, min(side, int(round(w * scale))))
+    resized = _resize_chw_to(tensor, (out_h, out_w))
+    canvas = tensor.new_full((tensor.shape[0], side, side), float(fill))
+    y0 = (side - out_h) // 2
+    x0 = (side - out_w) // 2
+    canvas[:, y0 : y0 + out_h, x0 : x0 + out_w] = resized
+    if clamp is not None:
+        canvas = canvas.clamp(float(clamp[0]), float(clamp[1]))
+    return canvas
+
+
+def _global_context_square_side(sequence: TiledExrSequence, cap: int) -> int:
+    requested = max(1, int(cap))
+    source_long = max(int(sequence.info.height), int(sequence.info.width))
+    return min(requested, source_long)
+
+
+def _build_pseudo_global_fg_guidance(video_global: Tensor, seed_global: Tensor, mode: str) -> Optional[Tensor]:
+    """Build inference-time global FG guidance in the model's expected shape."""
+    key = str(mode).strip().lower().replace("_", "-")
+    if key in {"none", "off", "false", "0"}:
+        return None
+    if key == "input":
+        return video_global
+    if key in {"masked-input", "alpha-masked-input", "premul-input"}:
+        return video_global * seed_global.unsqueeze(0)
+    raise ValueError(f"Unsupported global FG guidance mode: {mode!r}")
+
+
+def _tile_core_bounds(
+    *,
+    tile: Tile,
+    y_starts: Sequence[int],
+    x_starts: Sequence[int],
+    tile_size: int,
+    full_h: int,
+    full_w: int,
+) -> Tile:
+    """Return the central output region owned by a tile."""
+    y_index = y_starts.index(tile.y0)
+    x_index = x_starts.index(tile.x0)
+
+    if y_index == 0:
+        y0 = tile.y0
+    else:
+        prev_end = y_starts[y_index - 1] + tile_size
+        y0 = (tile.y0 + prev_end) // 2
+
+    if y_index + 1 == len(y_starts):
+        y1 = min(tile.y1, full_h)
+    else:
+        next_start = y_starts[y_index + 1]
+        y1 = (tile.y1 + next_start) // 2
+
+    if x_index == 0:
+        x0 = tile.x0
+    else:
+        prev_end = x_starts[x_index - 1] + tile_size
+        x0 = (tile.x0 + prev_end) // 2
+
+    if x_index + 1 == len(x_starts):
+        x1 = min(tile.x1, full_w)
+    else:
+        next_start = x_starts[x_index + 1]
+        x1 = (tile.x1 + next_start) // 2
+
+    return Tile(y0=max(0, y0), y1=min(full_h, y1), x0=max(0, x0), x1=min(full_w, x1))
 
 
 def _load_v3_model(
@@ -102,6 +184,7 @@ def _run_v3_global_context(
     seed_alpha_cpu: Tensor,
     temporal_frames: int,
     global_long_side_cap: int,
+    global_fg_guidance_mode: str,
     amp: bool,
     amp_dtype: torch.dtype,
     device: torch.device,
@@ -110,7 +193,7 @@ def _run_v3_global_context(
 
     Returns: [B=1, M, C] global tokens.
     """
-    global_hw = _global_context_hw(sequence.info, global_long_side_cap)
+    global_side = _global_context_square_side(sequence, global_long_side_cap)
     full_frame = Tile(y0=0, y1=sequence.info.height, x0=0, x1=sequence.info.width)
     video_full, _, _ = sequence.read_window_tile(
         start=window_start,
@@ -118,19 +201,35 @@ def _run_v3_global_context(
         tile=full_frame,
     )
     video_global = torch.stack(
-        [_resize_chw_to(frame, global_hw) for frame in video_full], dim=0
+        [_letterbox_chw_to_square(frame, global_side, fill=0.0) for frame in video_full],
+        dim=0,
     )
-    seed_global = _resize_alpha_to(seed_alpha_cpu, global_hw)
+    seed_global = _letterbox_chw_to_square(
+        seed_alpha_cpu,
+        global_side,
+        fill=0.0,
+        clamp=(0.0, 1.0),
+    )
+    fg_guidance_global = _build_pseudo_global_fg_guidance(
+        video_global,
+        seed_global,
+        global_fg_guidance_mode,
+    )
 
     video_dev = video_global.unsqueeze(0).to(device=device, dtype=torch.float32)
     seed_dev = seed_global.unsqueeze(0).to(device=device, dtype=torch.float32)
+    fg_guidance_dev = (
+        fg_guidance_global.unsqueeze(0).to(device=device, dtype=torch.float32)
+        if fg_guidance_global is not None
+        else None
+    )
 
     with _autocast_context(device, amp, amp_dtype):
         if hasattr(model, "_build_global_input"):
             coarse_bc, green_priors, fg_guidance = model._build_global_input(
                 video_dev,
                 seed_dev,
-                global_fg_guidance=None,
+                global_fg_guidance=fg_guidance_dev,
             )
             global_tokens, _ = model.global_context(
                 video_rgb_global=video_dev,
@@ -140,7 +239,7 @@ def _run_v3_global_context(
             )
         else:
             coarse_bc = torch.zeros(
-                1, temporal_frames, 1, global_hw[0], global_hw[1],
+                1, temporal_frames, 1, global_side, global_side,
                 device=device, dtype=video_dev.dtype,
             )
             coarse_bc[:, 0] = seed_dev
@@ -156,6 +255,7 @@ def _run_v3_global_context(
                 video_rgb_global=video_dev,
                 coarse_alpha_global=coarse_bc,
                 green_priors_global=green_priors,
+                fg_guidance_global=fg_guidance_dev,
             )
 
     return global_tokens
@@ -173,6 +273,8 @@ def run_v3_tiled_inference(
     temporal_stride: int = 1,
     use_global_context: bool = True,
     global_long_side_cap: int = 512,
+    global_fg_guidance_mode: str = "masked-input",
+    tile_merge_mode: str = "blend",
     amp: bool = True,
     amp_dtype: torch.dtype = torch.bfloat16,
     device: torch.device = torch.device("cuda"),
@@ -203,6 +305,9 @@ def run_v3_tiled_inference(
         Tile(y0=y, y1=y + tile_size, x0=x, x1=x + tile_size)
         for y in y_starts for x in x_starts
     ]
+    merge_mode = str(tile_merge_mode).strip().lower()
+    if merge_mode not in {"blend", "crop"}:
+        raise ValueError("--tile-merge-mode must be 'blend' or 'crop'")
 
     for start_i, start in enumerate(starts):
         actual = min(n_frames - start, temporal_frames)
@@ -218,6 +323,7 @@ def run_v3_tiled_inference(
                 seed_alpha_cpu=carry_seed,
                 temporal_frames=temporal_frames,
                 global_long_side_cap=global_long_side_cap,
+                global_fg_guidance_mode=global_fg_guidance_mode,
                 amp=amp,
                 amp_dtype=amp_dtype,
                 device=device,
@@ -263,11 +369,25 @@ def run_v3_tiled_inference(
 
             alpha_tile = out["alpha_pred"][0].detach().cpu().clamp(0.0, 1.0).to(torch.float32)
             fg_tile = out["fg_pred"][0].detach().cpu().to(torch.float32)
-            weight = _tile_weight(tile, h_pad, w_pad, tile_overlap, torch.device("cpu"))
-
-            alpha_acc[:, :, tile.y0:tile.y1, tile.x0:tile.x1] += alpha_tile * weight
-            fg_acc[:, :, tile.y0:tile.y1, tile.x0:tile.x1] += fg_tile * weight
-            weight_acc[:, :, tile.y0:tile.y1, tile.x0:tile.x1] += weight
+            if merge_mode == "crop":
+                core = _tile_core_bounds(
+                    tile=tile,
+                    y_starts=y_starts,
+                    x_starts=x_starts,
+                    tile_size=tile_size,
+                    full_h=h_pad,
+                    full_w=w_pad,
+                )
+                ly0, ly1 = core.y0 - tile.y0, core.y1 - tile.y0
+                lx0, lx1 = core.x0 - tile.x0, core.x1 - tile.x0
+                alpha_acc[:, :, core.y0:core.y1, core.x0:core.x1] = alpha_tile[:, :, ly0:ly1, lx0:lx1]
+                fg_acc[:, :, core.y0:core.y1, core.x0:core.x1] = fg_tile[:, :, ly0:ly1, lx0:lx1]
+                weight_acc[:, :, core.y0:core.y1, core.x0:core.x1] = 1.0
+            else:
+                weight = _tile_weight(tile, h_pad, w_pad, tile_overlap, torch.device("cpu"))
+                alpha_acc[:, :, tile.y0:tile.y1, tile.x0:tile.x1] += alpha_tile * weight
+                fg_acc[:, :, tile.y0:tile.y1, tile.x0:tile.x1] += fg_tile * weight
+                weight_acc[:, :, tile.y0:tile.y1, tile.x0:tile.x1] += weight
 
             del video_dev, seed_dev, valid_mask_dev, out
 
@@ -314,10 +434,26 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--tile-size", type=int, default=1024)
     parser.add_argument("--tile-overlap", type=int, default=64)
+    parser.add_argument("--tile-merge-mode", choices=("blend", "crop"), default="blend")
     parser.add_argument("--temporal-frames", type=int, default=4)
     parser.add_argument("--temporal-stride", type=int, default=1)
     parser.add_argument("--global-context", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--global-long-side-cap", type=int, default=512)
+    parser.add_argument(
+        "--global-long-side-cap",
+        type=int,
+        default=0,
+        help="Square global context side. Defaults to config data.global_context_long_side, then 1024.",
+    )
+    parser.add_argument(
+        "--global-fg-guidance",
+        choices=("masked-input", "input", "none"),
+        default="masked-input",
+        help=(
+            "Inference-time global FG guidance. 'masked-input' uses the global "
+            "input multiplied by the current alpha seed; 'input' uses raw global "
+            "RGB; 'none' leaves guidance blank."
+        ),
+    )
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--amp-dtype", default="bf16", choices=("bf16", "fp16", "fp32"))
     parser.add_argument("--compile-model", action="store_true")
@@ -380,6 +516,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     amp = bool(args.amp and amp_dtype is not torch.float32)
 
     data_cfg = dict(cfg.get("data", {}))
+    train_cfg = dict(cfg.get("train", {}))
+    inference_cfg = dict(cfg.get("inference", {}))
+    global_long_side_cap = int(
+        args.global_long_side_cap
+        or data_cfg.get(
+            "global_context_long_side",
+            train_cfg.get("global_long_side_cap", inference_cfg.get("global_long_side_cap", 1024)),
+        )
+    )
     fg_representation = str(
         cfg.get("model", {}).get("fg_representation",
         data_cfg.get("fg_representation", "premul"))
@@ -387,9 +532,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     print(
         f"[v3-infer] tile={args.tile_size} overlap={args.tile_overlap} "
+        f"merge={args.tile_merge_mode} "
         f"temporal={args.temporal_frames} stride={args.temporal_stride} "
         f"global_context={args.global_context} "
-        f"global_cap={args.global_long_side_cap} "
+        f"global_cap={global_long_side_cap} "
+        f"global_fg_guidance={args.global_fg_guidance} "
         f"amp={amp_dtype if amp else 'off'}",
         flush=True,
     )
@@ -400,10 +547,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         initial_alpha_cpu=alpha_cpu,
         tile_size=args.tile_size,
         tile_overlap=args.tile_overlap,
+        tile_merge_mode=args.tile_merge_mode,
         temporal_frames=args.temporal_frames,
         temporal_stride=args.temporal_stride,
         use_global_context=args.global_context,
-        global_long_side_cap=args.global_long_side_cap,
+        global_long_side_cap=global_long_side_cap,
+        global_fg_guidance_mode=args.global_fg_guidance,
         amp=amp,
         amp_dtype=amp_dtype,
         device=device,
