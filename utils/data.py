@@ -101,7 +101,7 @@ def _green_foreground_challenge_premul(
     """
     alpha_safe = alpha.clamp_min(eps)
     visible = (alpha > 0.05).to(fg_premul.dtype)
-    straight = (fg_premul / alpha_safe) * visible
+    straight = fg_premul / alpha_safe
     luma = 0.299 * straight[:, 0:1] + 0.587 * straight[:, 1:2] + 0.114 * straight[:, 2:3]
 
     color = torch.tensor(green_rgb, dtype=fg_premul.dtype, device=fg_premul.device).view(1, 3, 1, 1)

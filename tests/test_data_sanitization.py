@@ -8,7 +8,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch
 
 from utils.data import CorridorMattingTransform
-from utils.device_transform import DeviceMattingTransform, DeviceMattingTransformConfig
+from utils.device_transform import (
+    DeviceMattingTransform,
+    DeviceMattingTransformConfig,
+    apply_green_foreground_augmentation,
+)
 
 
 def test_transform_sanitizes_hdr_and_invalid_source_values():
@@ -169,3 +173,37 @@ def test_device_transform_sanitizes_precomputed_global_fg_guidance():
     assert torch.equal(out["global_video_rgb"], global_input)
     assert out["global_fg_gt"].min() >= 0
     assert out["global_fg_gt"].max() <= 1
+
+
+def test_green_foreground_augmentation_preserves_alpha_and_shading():
+    torch.manual_seed(0)
+    alpha = torch.ones(1, 1, 1, 2, 2)
+    straight = torch.tensor(
+        [[[[[0.10, 0.20], [0.40, 0.80]], [[0.10, 0.20], [0.40, 0.80]], [[0.10, 0.20], [0.40, 0.80]]]]]
+    )
+    fg = straight * alpha
+
+    out = apply_green_foreground_augmentation(
+        fg,
+        alpha,
+        prob=1.0,
+        strength_min=1.0,
+        strength_max=1.0,
+        alpha_thresh=0.75,
+    )
+
+    assert out.shape == fg.shape
+    assert out[:, :, 1].mean() > out[:, :, 0].mean()
+    assert out[:, :, 1].mean() > out[:, :, 2].mean()
+    assert out[0, 0, 1, 0, 0] < out[0, 0, 1, 1, 1]
+
+    low_alpha = alpha * 0.25
+    unchanged = apply_green_foreground_augmentation(
+        fg * low_alpha,
+        low_alpha,
+        prob=1.0,
+        strength_min=1.0,
+        strength_max=1.0,
+        alpha_thresh=0.75,
+    )
+    assert torch.equal(unchanged, fg * low_alpha)

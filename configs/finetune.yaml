@@ -30,13 +30,21 @@ model:
   predict_spill_mask: true
   predict_quality_eval: true
   fg_representation: premul
+  input_residual_despill_base: true
+  input_residual_despill_strength: 1.0
+  alpha_only_refine: true
+  alpha_only_refine_strength: 0.75
+  alpha_only_refine_kernel_size: 5
 
   global_context_dim: 256
   global_context_layers: 4
   global_context_heads: 8
   global_context_tokens: 64
+  # Keep the alpha channel for checkpoint shape compatibility, but feed zeros
+  # so global context cannot depend on a decaying inference seed.
+  global_context_alpha_mode: zero
   # Kept true for checkpoint shape compatibility. This finetune omits global
-  # FG sidecars below, so the channel is zero/pseudo-guided rather than GT FG.
+  # FG sidecars below, so the channel is zero-filled rather than GT FG.
   use_global_fg_guidance: true
 
   use_reference_memory: true
@@ -48,7 +56,7 @@ model:
   native_refiner_blocks: 2
   native_refiner_hidden: 48
   native_refiner_chunk_frames: 1
-  native_refiner_max_alpha_delta: 0.03
+  native_refiner_max_alpha_delta: 0.08
   native_refiner_max_fg_delta: 0.20
   native_refiner_max_spill_delta: 0.20
 
@@ -76,7 +84,7 @@ data:
   device_augment: true
   host_dtype: fp16
   read_dtype: fp16
-  num_torch_threads: 4
+  num_torch_threads: 1
   horizontal_flip_p: 0.5
   temporal_jitter_p: 0.0
   background_replace_p: 0.3
@@ -89,6 +97,7 @@ data:
   green_foreground_alpha_thresh: 0.75
   coarse_alpha_drop_prob: 0.05
   grayscale_augment_p: 0.20
+  hue_jitter_max: 0.0
 
   decode_full_frame: false
   emit_global_context: true
@@ -97,15 +106,15 @@ data:
   local_tile_span: 4
   source_hw: [2048, 2048]
   exr_internal_threads: 0
-  exr_decode_threads: 8
+  exr_decode_threads: 4
   emit_tile_metadata: true
   decode_global_context: true
   cached_four_quadrant_batch: true
-  # Input+Alpha are enough for global context in the alpha-first regime; GT FG
-  # guidance would make eval/train easier than inference.
+  # Keep Input+Alpha sidecars available for compatibility; the model zeros the
+  # global alpha channel, and GT FG guidance would make train easier than inference.
   global_context_modalities: [Input, Alpha]
-  num_workers: 24
-  prefetch_factor: 2
+  num_workers: 4
+  prefetch_factor: 1
   persistent_workers: true
   pin_memory: true
 
@@ -128,8 +137,8 @@ train:
   rematerialize_activations: true
   ema:
     enabled: true
-    decay: 0.9999
-    update_after_step: 0
+    decay: 0.999
+    update_after_step: 100
     update_every: 1
     device: model
 

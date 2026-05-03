@@ -94,10 +94,14 @@ def apply_green_foreground_augmentation(
     strength_max: float = 0.75,
     alpha_thresh: float = 0.70,
 ) -> Tensor:
-    """Tint confident true foreground regions green.
+    """Tint confident true foreground regions green while preserving shading.
 
     fg:    [B,T,3,H,W]
     alpha: [B,T,1,H,W]
+
+    Source FG is premultiplied at this point. Convert visible pixels to
+    straight colour, recolour by luminance, then premultiply again so the
+    later compose creates a self-consistent faux greenscreen input.
     """
     if prob <= 0.0:
         return fg
@@ -105,7 +109,7 @@ def apply_green_foreground_augmentation(
     if torch.rand((), device=fg.device) >= float(prob):
         return fg
 
-    mask = (alpha > float(alpha_thresh)).to(dtype=fg.dtype)
+    visible = (alpha > float(alpha_thresh)).to(dtype=fg.dtype)
     s_min = float(strength_min)
     s_max = max(s_min, float(strength_max))
     strength = torch.empty(
@@ -114,14 +118,24 @@ def apply_green_foreground_augmentation(
         dtype=fg.dtype,
     ).uniform_(s_min, s_max)
 
-    green = torch.tensor(
-        [0.05, 0.85, 0.15],
+    green = torch.empty(
+        (fg.shape[0], 1, 3, 1, 1),
         device=fg.device,
         dtype=fg.dtype,
-    ).view(1, 1, 3, 1, 1)
+    )
+    green[:, :, 0:1].uniform_(0.03, 0.18)
+    green[:, :, 1:2].uniform_(0.85, 1.25)
+    green[:, :, 2:3].uniform_(0.03, 0.22)
 
-    fg_aug = fg * (1.0 - mask * strength) + green * (mask * strength)
-    return fg_aug.clamp(0.0, 1.0)
+    alpha_safe = alpha.clamp_min(_EPS)
+    straight = fg / alpha_safe
+    luma = 0.299 * straight[:, :, 0:1] + 0.587 * straight[:, :, 1:2] + 0.114 * straight[:, :, 2:3]
+    green_luma = (0.299 * green[:, :, 0:1] + 0.587 * green[:, :, 1:2] + 0.114 * green[:, :, 2:3]).clamp_min(_EPS)
+    target = luma * (green / green_luma)
+
+    blend = visible * strength
+    straight_aug = straight * (1.0 - blend) + target * blend
+    return (straight_aug * alpha).clamp(0.0, 1.0)
 
 
 # ---------------------------------------------------------------------------

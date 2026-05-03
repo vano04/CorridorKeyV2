@@ -25,6 +25,7 @@ from .transformer_engine_utils import resolve_fp8_config, transformer_engine_ava
 EPS = 1e-6
 FG_REPRESENTATIONS = {"premul", "straight"}
 FG_PREDICTION_MODES = {"decoder", "input_residual"}
+GLOBAL_CONTEXT_ALPHA_MODES = {"seed", "zero"}
 
 
 def _validate_fg_representation(value: str) -> str:
@@ -41,10 +42,70 @@ def _validate_fg_prediction_mode(value: str) -> str:
     return mode
 
 
+def _validate_global_context_alpha_mode(value: str) -> str:
+    mode = str(value).strip().lower().replace("_", "-")
+    if mode in {"none", "off", "false", "0"}:
+        return "zero"
+    if mode not in GLOBAL_CONTEXT_ALPHA_MODES:
+        raise ValueError(f"Unsupported global_context_alpha_mode={value!r}")
+    return mode
+
+
 def _composite_fg(fg: Tensor, bg: Tensor, alpha: Tensor, representation: str) -> Tensor:
     if representation == "straight":
         return fg * alpha + (1.0 - alpha) * bg
     return fg + (1.0 - alpha) * bg
+
+
+def _input_residual_fg_base(
+    video: Tensor,
+    alpha: Tensor,
+    *,
+    despill: bool,
+    strength: float,
+) -> Tensor:
+    base = video * alpha
+    if not despill or strength <= 0.0:
+        return base.clamp(0.0, 1.0)
+
+    r = video[:, :, 0:1]
+    g = video[:, :, 1:2]
+    b = video[:, :, 2:3]
+    green_excess = (g - torch.maximum(r, b)).clamp_min(0.0)
+    transition = (alpha * (1.0 - alpha) * 4.0).clamp(0.0, 1.0)
+    correction = green_excess * alpha * (1.0 - alpha) * transition * float(strength)
+    corrected_g = (base[:, :, 1:2] - correction).clamp_min(0.0)
+    return torch.cat([base[:, :, 0:1], corrected_g, base[:, :, 2:3]], dim=2).clamp(0.0, 1.0)
+
+
+def _alpha_only_edge_refine(
+    alpha: Tensor,
+    refine_mask: Optional[Tensor],
+    *,
+    strength: float,
+    kernel_size: int,
+) -> Tuple[Tensor, Tensor]:
+    if strength <= 0.0:
+        return alpha, torch.zeros_like(alpha)
+
+    k = max(3, int(kernel_size))
+    if k % 2 == 0:
+        k += 1
+    pad = k // 2
+    b, t, _, h, w = alpha.shape
+    flat = alpha.reshape(b * t, 1, h, w)
+    low = F.avg_pool2d(F.pad(flat, (pad, pad, pad, pad), mode="replicate"), kernel_size=k, stride=1)
+    high = flat - low
+
+    transition = (flat * (1.0 - flat) * 4.0).clamp(0.0, 1.0)
+    gate = transition
+    if refine_mask is not None:
+        gate = gate * refine_mask.reshape(b * t, 1, h, w).clamp(0.0, 1.0)
+
+    contrast = (flat - 0.5) * 0.5
+    delta = (high + contrast) * gate * float(strength)
+    refined = (flat + delta).clamp(0.0, 1.0)
+    return refined.reshape_as(alpha), delta.reshape_as(alpha)
 
 
 def _compute_padding(h: int, w: int, multiple: int) -> Tuple[int, int]:
@@ -179,12 +240,18 @@ class V3HybridVideoMattingModel(nn.Module):
         predict_quality_eval: bool = True,
         fg_representation: str = "premul",
         fg_prediction_mode: str = "decoder",
+        input_residual_despill_base: bool = False,
+        input_residual_despill_strength: float = 1.0,
+        alpha_only_refine: bool = False,
+        alpha_only_refine_strength: float = 0.75,
+        alpha_only_refine_kernel_size: int = 5,
         # Global context
         global_context_dim: int = 256,
         global_context_layers: int = 4,
         global_context_heads: int = 8,
         global_context_tokens: int = 64,
         use_global_fg_guidance: bool = False,
+        global_context_alpha_mode: str = "seed",
         # Reference memory
         use_reference_memory: bool = True,
         reference_tokens_per_frame: int = 32,
@@ -226,11 +293,17 @@ class V3HybridVideoMattingModel(nn.Module):
         self.predict_quality_eval = predict_quality_eval
         self.fg_representation = _validate_fg_representation(fg_representation)
         self.fg_prediction_mode = _validate_fg_prediction_mode(fg_prediction_mode)
+        self.input_residual_despill_base = bool(input_residual_despill_base)
+        self.input_residual_despill_strength = float(input_residual_despill_strength)
+        self.alpha_only_refine = bool(alpha_only_refine)
+        self.alpha_only_refine_strength = float(alpha_only_refine_strength)
+        self.alpha_only_refine_kernel_size = int(alpha_only_refine_kernel_size)
         self.use_green_priors = use_green_priors
         self.use_coordinate_channels = use_coordinate_channels
         self.use_unknown_band = use_unknown_band
         self.guidance_presence_flag = guidance_presence_flag
         self.use_global_fg_guidance = bool(use_global_fg_guidance)
+        self.global_context_alpha_mode = _validate_global_context_alpha_mode(global_context_alpha_mode)
         self.green_prior_dropout = float(max(0.0, min(1.0, green_prior_dropout)))
         self.coarse_alpha_drop_prob = float(max(0.0, min(1.0, coarse_alpha_drop_prob)))
         self.use_native_refiner = use_native_refiner
@@ -402,7 +475,8 @@ class V3HybridVideoMattingModel(nn.Module):
         """
         b, t, _, h, w = global_video.shape
         cond = torch.zeros(b, t, 1, h, w, device=global_video.device, dtype=global_video.dtype)
-        cond[:, 0] = global_coarse_alpha_init
+        if self.global_context_alpha_mode == "seed":
+            cond[:, 0] = global_coarse_alpha_init
         fg_guidance = None
         if self.use_global_fg_guidance:
             if global_fg_guidance is not None:
@@ -558,11 +632,18 @@ class V3HybridVideoMattingModel(nn.Module):
             if spill_mask_pred is not None: spill_mask_pred = _unpad_video(spill_mask_pred.reshape(b, t, 1, target_h, target_w), pad_hw)
             if quality_eval_pred is not None: quality_eval_pred = _unpad_video(quality_eval_pred.reshape(b, t, 1, target_h, target_w), pad_hw)
 
-            input_fg_base = (video * alpha_pred).clamp(0.0, 1.0)
+            input_fg_base = _input_residual_fg_base(
+                video,
+                alpha_pred,
+                despill=self.input_residual_despill_base,
+                strength=self.input_residual_despill_strength,
+            )
             if self.fg_prediction_mode == "input_residual":
                 fg_pred = input_fg_base
 
             coarse_alpha_pred, coarse_fg_pred, coarse_spill_pred = alpha_pred, fg_pred, spill_mask_pred
+            alpha_only_delta_pred: Optional[Tensor] = None
+            alpha_only_refine_mask: Optional[Tensor] = None
 
             if self.native_refiner is not None:
                 alpha_refine_mask_full = _boundary_band(alpha_pred)
@@ -603,6 +684,18 @@ class V3HybridVideoMattingModel(nn.Module):
                 if "uncertainty_refined" in refiner_out: uncertainty_pred = refiner_out["uncertainty_refined"]
                 refine_mask = torch.maximum(alpha_refine_mask_full, fg_refine_mask_full).reshape(b*t, 1, h, w)
 
+            if self.alpha_only_refine:
+                alpha_only_refine_mask = _boundary_band(alpha_pred)
+                if uncertainty_pred is not None:
+                    alpha_only_refine_mask = torch.maximum(alpha_only_refine_mask, uncertainty_pred)
+                alpha_only_refine_mask = alpha_only_refine_mask.clamp(0.0, 1.0)
+                alpha_pred, alpha_only_delta_pred = _alpha_only_edge_refine(
+                    alpha_pred,
+                    alpha_only_refine_mask,
+                    strength=self.alpha_only_refine_strength,
+                    kernel_size=self.alpha_only_refine_kernel_size,
+                )
+
             comp_pred = _composite_fg(fg_pred, bg_for_comp if bg_for_comp is not None else video, alpha_pred, self.fg_representation)
 
             out = {
@@ -618,6 +711,10 @@ class V3HybridVideoMattingModel(nn.Module):
             if uncertainty_pred is not None: out["uncertainty_pred"] = uncertainty_pred
             if spill_mask_pred is not None: out["spill_mask_pred"] = spill_mask_pred
             if quality_eval_pred is not None: out["quality_eval_pred"] = quality_eval_pred
+            if alpha_only_delta_pred is not None:
+                out["alpha_only_delta_pred"] = alpha_only_delta_pred
+            if alpha_only_refine_mask is not None:
+                out["alpha_only_refine_mask"] = alpha_only_refine_mask
             if self.native_refiner is not None:
                 out.update({
                     "native_alpha_delta_pred": refiner_out["native_alpha_delta_pred"],
@@ -661,11 +758,17 @@ def build_v3_hybrid_video_matting_model(config: Dict[str, Any]) -> V3HybridVideo
         predict_quality_eval=bool(config.get("predict_quality_eval", True)),
         fg_representation=str(config.get("fg_representation", "premul")),
         fg_prediction_mode=str(config.get("fg_prediction_mode", "decoder")),
+        input_residual_despill_base=bool(config.get("input_residual_despill_base", False)),
+        input_residual_despill_strength=float(config.get("input_residual_despill_strength", 1.0)),
+        alpha_only_refine=bool(config.get("alpha_only_refine", False)),
+        alpha_only_refine_strength=float(config.get("alpha_only_refine_strength", 0.75)),
+        alpha_only_refine_kernel_size=int(config.get("alpha_only_refine_kernel_size", 5)),
         global_context_dim=int(config.get("global_context_dim", 256)),
         global_context_layers=int(config.get("global_context_layers", 4)),
         global_context_heads=int(config.get("global_context_heads", 8)),
         global_context_tokens=int(config.get("global_context_tokens", 64)),
         use_global_fg_guidance=bool(config.get("use_global_fg_guidance", False)),
+        global_context_alpha_mode=str(config.get("global_context_alpha_mode", "seed")),
         use_reference_memory=bool(config.get("use_reference_memory", True)),
         reference_tokens_per_frame=int(config.get("reference_tokens_per_frame", 32)),
         num_reference_frames=int(config.get("num_reference_frames", 2)),

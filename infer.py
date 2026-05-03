@@ -447,11 +447,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--global-fg-guidance",
         choices=("masked-input", "input", "none"),
-        default="masked-input",
+        default="none",
         help=(
-            "Inference-time global FG guidance. 'masked-input' uses the global "
-            "input multiplied by the current alpha seed; 'input' uses raw global "
-            "RGB; 'none' leaves guidance blank."
+            "Inference-time global FG guidance. 'none' matches alpha-first "
+            "finetunes without global FG sidecars; 'masked-input' uses global "
+            "RGB multiplied by the current alpha seed; 'input' uses raw global RGB."
         ),
     )
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
