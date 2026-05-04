@@ -273,6 +273,10 @@ class V3MattingLossComputer(nn.Module):
         # Quality eval
         self.w_quality_eval = float(weights.get("quality_eval", 0.1))
 
+        # RGB-only global semantic prior supervision
+        self.w_semantic_prior_bce = float(weights.get("semantic_prior_bce", 0.0))
+        self.w_semantic_prior_dice = float(weights.get("semantic_prior_dice", 0.0))
+
     @staticmethod
     def _enabled(weight: float) -> bool:
         return float(weight) > 0.0
@@ -527,6 +531,58 @@ class V3MattingLossComputer(nn.Module):
             l_quality = _masked_mean((pred["quality_eval_pred"].float() - quality_target).abs(), vmask)
         items["quality_eval"] = l_quality
 
+        # ---- Semantic fg/bg prior ----
+        l_semantic_bce = torch.tensor(0.0, device=device)
+        l_semantic_dice = torch.tensor(0.0, device=device)
+        if (
+            "semantic_fg_logits" in pred
+            and (self._enabled(self.w_semantic_prior_bce) or self._enabled(self.w_semantic_prior_dice))
+        ):
+            semantic_logits = pred["semantic_fg_logits"].float()
+            semantic_target = batch.get("global_alpha_gt", alpha_g)
+            semantic_target = _sanitize_alpha_target(semantic_target).to(device=device)
+            if semantic_target.ndim == 4:
+                semantic_target = semantic_target[:, None]
+            if semantic_target.shape[-2:] != semantic_logits.shape[-2:]:
+                bt_target = semantic_target.reshape(
+                    semantic_target.shape[0] * semantic_target.shape[1],
+                    semantic_target.shape[2],
+                    semantic_target.shape[3],
+                    semantic_target.shape[4],
+                )
+                semantic_target = F.interpolate(
+                    bt_target,
+                    size=semantic_logits.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                ).reshape(
+                    semantic_target.shape[0],
+                    semantic_target.shape[1],
+                    semantic_target.shape[2],
+                    semantic_logits.shape[-2],
+                    semantic_logits.shape[-1],
+                )
+            if semantic_target.shape[1] != semantic_logits.shape[1]:
+                semantic_target = semantic_target[:, :1].expand(-1, semantic_logits.shape[1], -1, -1, -1)
+
+            semantic_weight = torch.ones_like(semantic_target)
+            if valid_mask is not None and semantic_target.shape[1] == valid_mask.shape[1]:
+                semantic_weight = semantic_weight * valid_mask[:, :, None, None, None]
+
+            semantic_bce = F.binary_cross_entropy_with_logits(
+                semantic_logits,
+                semantic_target.clamp(0.0, 1.0),
+                reduction="none",
+            )
+            l_semantic_bce = (semantic_bce * semantic_weight).sum() / semantic_weight.sum().clamp_min(1.0)
+
+            semantic_prob = semantic_logits.sigmoid()
+            intersection = (semantic_prob * semantic_target * semantic_weight).sum()
+            denom = ((semantic_prob + semantic_target) * semantic_weight).sum().clamp_min(1.0)
+            l_semantic_dice = 1.0 - (2.0 * intersection + 1.0) / (denom + 1.0)
+        items["semantic_prior_bce"] = l_semantic_bce
+        items["semantic_prior_dice"] = l_semantic_dice
+
         # ---- Total (in-place add to avoid extra allocations) ----
         total = self._zero(device)
         total.add_(self.w_alpha_l1 * l_alpha_l1)
@@ -548,6 +604,8 @@ class V3MattingLossComputer(nn.Module):
         total.add_(self.w_native_fg_delta * l_delta_fg)
         total.add_(self.w_uncertainty * l_uncertainty)
         total.add_(self.w_quality_eval * l_quality)
+        total.add_(self.w_semantic_prior_bce * l_semantic_bce)
+        total.add_(self.w_semantic_prior_dice * l_semantic_dice)
 
         items["total"] = total
         return total, items

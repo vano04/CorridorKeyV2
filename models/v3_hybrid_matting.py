@@ -17,6 +17,7 @@ from .global_context import GlobalContextBranch
 from .local_tile_encoder import LocalTileEncoder
 from .native_detail_refiner import NativeDetailRefiner
 from .reference_memory import ReferenceMemoryBank
+from .semantic_prior import DinoStyleSemanticPrior
 from .heads import AlphaHead, ForegroundHead, UncertaintyHead, SpillMaskHead, QualityEvalHead
 from .positional import make_tile_coordinate_channels, make_default_tile_coords
 from .transformer_engine_utils import resolve_fp8_config, transformer_engine_available
@@ -76,6 +77,23 @@ def _input_residual_fg_base(
     correction = green_excess * alpha * (1.0 - alpha) * transition * float(strength)
     corrected_g = (base[:, :, 1:2] - correction).clamp_min(0.0)
     return torch.cat([base[:, :, 0:1], corrected_g, base[:, :, 2:3]], dim=2).clamp(0.0, 1.0)
+
+
+def _input_residual_correction_blend_mask(
+    alpha: Tensor,
+    spill_mask: Optional[Tensor] = None,
+    uncertainty: Optional[Tensor] = None,
+) -> Tensor:
+    transition = (alpha * (1.0 - alpha) * 4.0).clamp(0.0, 1.0)
+    cue: Optional[Tensor] = None
+    if spill_mask is not None:
+        cue = spill_mask.clamp(0.0, 1.0)
+    if uncertainty is not None:
+        uncertainty = uncertainty.clamp(0.0, 1.0)
+        cue = uncertainty if cue is None else torch.maximum(cue, uncertainty)
+    if cue is None:
+        cue = torch.ones_like(transition)
+    return (transition * cue).clamp(0.0, 1.0)
 
 
 def _alpha_only_edge_refine(
@@ -252,6 +270,16 @@ class V3HybridVideoMattingModel(nn.Module):
         global_context_tokens: int = 64,
         use_global_fg_guidance: bool = False,
         global_context_alpha_mode: str = "seed",
+        use_semantic_prior: bool = False,
+        semantic_prior_dim: int = 256,
+        semantic_prior_patch_size: Optional[int] = None,
+        semantic_prior_layers: int = 4,
+        semantic_prior_heads: int = 8,
+        semantic_prior_tokens: Optional[int] = None,
+        semantic_prior_dropout: float = 0.0,
+        semantic_prior_fusion_scale: float = 1.0,
+        semantic_prior_grayscale: bool = False,
+        semantic_prior_grayscale_prob: float = 0.0,
         # Reference memory
         use_reference_memory: bool = True,
         reference_tokens_per_frame: int = 32,
@@ -304,6 +332,8 @@ class V3HybridVideoMattingModel(nn.Module):
         self.guidance_presence_flag = guidance_presence_flag
         self.use_global_fg_guidance = bool(use_global_fg_guidance)
         self.global_context_alpha_mode = _validate_global_context_alpha_mode(global_context_alpha_mode)
+        self.use_semantic_prior = bool(use_semantic_prior)
+        self.semantic_prior_fusion_scale = float(semantic_prior_fusion_scale)
         self.green_prior_dropout = float(max(0.0, min(1.0, green_prior_dropout)))
         self.coarse_alpha_drop_prob = float(max(0.0, min(1.0, coarse_alpha_drop_prob)))
         self.use_native_refiner = use_native_refiner
@@ -339,6 +369,21 @@ class V3HybridVideoMattingModel(nn.Module):
             gradient_checkpointing=gradient_checkpointing,
             fp8_cfg=self.fp8_cfg,
         )
+        if self.use_semantic_prior:
+            self.semantic_prior = DinoStyleSemanticPrior(
+                dim=int(semantic_prior_dim),
+                global_dim=global_context_dim,
+                patch_size=int(semantic_prior_patch_size or patch_size),
+                depth=int(semantic_prior_layers),
+                num_heads=int(semantic_prior_heads),
+                num_tokens=int(semantic_prior_tokens or global_context_tokens),
+                dropout=float(semantic_prior_dropout),
+                grayscale_input=bool(semantic_prior_grayscale),
+                grayscale_prob=float(semantic_prior_grayscale_prob),
+                gradient_checkpointing=gradient_checkpointing,
+            )
+        else:
+            self.semantic_prior = None
 
         self.local_encoder = LocalTileEncoder(
             in_channels=in_ch,
@@ -505,6 +550,38 @@ class V3HybridVideoMattingModel(nn.Module):
             green_priors = torch.cat([ge, cd], dim=2)
         return cond, green_priors, fg_guidance
 
+    def build_global_tokens(
+        self,
+        global_video: Tensor,
+        global_coarse_alpha_init: Tensor,
+        global_fg_guidance: Optional[Tensor] = None,
+        green_excess: Optional[Tensor] = None,
+        chroma_dist: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Optional[Tensor]]:
+        c_bc, gp, fg_guidance = self._build_global_input(
+            global_video,
+            global_coarse_alpha_init,
+            global_fg_guidance=global_fg_guidance,
+            green_excess=green_excess,
+            chroma_dist=chroma_dist,
+        )
+        global_tokens, _ = self.global_context(
+            video_rgb_global=global_video,
+            coarse_alpha_global=c_bc,
+            green_priors_global=gp,
+            fg_guidance_global=fg_guidance,
+        )
+        semantic_fg_logits: Optional[Tensor] = None
+        if self.semantic_prior is not None:
+            semantic_tokens, semantic_fg_logits = self.semantic_prior(global_video)
+            if semantic_tokens.shape[1] != global_tokens.shape[1]:
+                raise ValueError(
+                    "semantic_prior_tokens must match global_context_tokens "
+                    f"for additive fusion; got {semantic_tokens.shape[1]} and {global_tokens.shape[1]}"
+                )
+            global_tokens = global_tokens + semantic_tokens.to(dtype=global_tokens.dtype) * self.semantic_prior_fusion_scale
+        return global_tokens, semantic_fg_logits
+
     def forward(
         self,
         video: Tensor,
@@ -549,18 +626,13 @@ class V3HybridVideoMattingModel(nn.Module):
 
             shared_ge: Optional[Tensor] = None
             shared_cd: Optional[Tensor] = None
+            semantic_fg_logits: Optional[Tensor] = None
             if global_tokens is None:
                 if global_video is not None and global_coarse_alpha_model is not None:
-                    c_bc, gp, fg_guidance = self._build_global_input(
+                    global_tokens, semantic_fg_logits = self.build_global_tokens(
                         global_video,
                         global_coarse_alpha_model,
                         global_fg_guidance=global_fg_guidance,
-                    )
-                    global_tokens, _ = self.global_context(
-                        video_rgb_global=global_video,
-                        coarse_alpha_global=c_bc,
-                        green_priors_global=gp,
-                        fg_guidance_global=fg_guidance,
                     )
                 else:
                     # global_video is None: both branches share the same tensor.
@@ -571,17 +643,11 @@ class V3HybridVideoMattingModel(nn.Module):
                     else:
                         shared_ge = None
                         shared_cd = None
-                    c_bc, gp, fg_guidance = self._build_global_input(
+                    global_tokens, semantic_fg_logits = self.build_global_tokens(
                         video,
                         coarse_alpha_model,
                         green_excess=shared_ge,
                         chroma_dist=shared_cd,
-                    )
-                    global_tokens, _ = self.global_context(
-                        video_rgb_global=video,
-                        coarse_alpha_global=c_bc,
-                        green_priors_global=gp,
-                        fg_guidance_global=fg_guidance,
                     )
 
             local_input = self._build_local_input(
@@ -638,8 +704,14 @@ class V3HybridVideoMattingModel(nn.Module):
                 despill=self.input_residual_despill_base,
                 strength=self.input_residual_despill_strength,
             )
+            input_residual_blend_mask: Optional[Tensor] = None
             if self.fg_prediction_mode == "input_residual":
-                fg_pred = input_fg_base
+                input_residual_blend_mask = _input_residual_correction_blend_mask(
+                    alpha_pred,
+                    spill_mask=spill_mask_pred,
+                    uncertainty=uncertainty_pred,
+                )
+                fg_pred = torch.lerp(input_fg_base, decoder_fg_pred, input_residual_blend_mask)
 
             coarse_alpha_pred, coarse_fg_pred, coarse_spill_pred = alpha_pred, fg_pred, spill_mask_pred
             alpha_only_delta_pred: Optional[Tensor] = None
@@ -651,11 +723,18 @@ class V3HybridVideoMattingModel(nn.Module):
                     alpha_refine_mask_full = torch.maximum(alpha_refine_mask_full, uncertainty_pred)
                 alpha_refine_mask_full = alpha_refine_mask_full.clamp(0, 1)
 
-                # FG detail is not an edge-only problem. The decoder head predicts
-                # from 1/patch_size features and is then upsampled, so the native
-                # refiner must be allowed to adjust visible foreground interiors
-                # using the full-resolution RGB tile.
-                fg_refine_mask_full = alpha_pred.detach().clamp(0, 1)
+                if self.fg_prediction_mode == "input_residual":
+                    fg_refine_mask_full = _input_residual_correction_blend_mask(
+                        alpha_pred.detach(),
+                        spill_mask=spill_mask_pred,
+                        uncertainty=uncertainty_pred,
+                    )
+                else:
+                    # Decoder-mode FG detail is not an edge-only problem. The
+                    # decoder head predicts from 1/patch_size features and is
+                    # then upsampled, so the native refiner must be allowed to
+                    # adjust visible foreground interiors using full-res RGB.
+                    fg_refine_mask_full = alpha_pred.detach().clamp(0, 1)
 
                 chunk_frames = max(1, min(self.native_refiner_chunk_frames, t))
                 refiner_chunks: Dict[str, List[Tensor]] = {}
@@ -710,7 +789,11 @@ class V3HybridVideoMattingModel(nn.Module):
             }
             if uncertainty_pred is not None: out["uncertainty_pred"] = uncertainty_pred
             if spill_mask_pred is not None: out["spill_mask_pred"] = spill_mask_pred
+            if input_residual_blend_mask is not None:
+                out["input_residual_blend_mask_pred"] = input_residual_blend_mask
             if quality_eval_pred is not None: out["quality_eval_pred"] = quality_eval_pred
+            if semantic_fg_logits is not None:
+                out["semantic_fg_logits"] = semantic_fg_logits
             if alpha_only_delta_pred is not None:
                 out["alpha_only_delta_pred"] = alpha_only_delta_pred
             if alpha_only_refine_mask is not None:
@@ -769,6 +852,20 @@ def build_v3_hybrid_video_matting_model(config: Dict[str, Any]) -> V3HybridVideo
         global_context_tokens=int(config.get("global_context_tokens", 64)),
         use_global_fg_guidance=bool(config.get("use_global_fg_guidance", False)),
         global_context_alpha_mode=str(config.get("global_context_alpha_mode", "seed")),
+        use_semantic_prior=bool(config.get("use_semantic_prior", False)),
+        semantic_prior_dim=int(config.get("semantic_prior_dim", config.get("global_context_dim", 256))),
+        semantic_prior_patch_size=(
+            int(config["semantic_prior_patch_size"]) if "semantic_prior_patch_size" in config else None
+        ),
+        semantic_prior_layers=int(config.get("semantic_prior_layers", 4)),
+        semantic_prior_heads=int(config.get("semantic_prior_heads", config.get("global_context_heads", 8))),
+        semantic_prior_tokens=(
+            int(config["semantic_prior_tokens"]) if "semantic_prior_tokens" in config else None
+        ),
+        semantic_prior_dropout=float(config.get("semantic_prior_dropout", 0.0)),
+        semantic_prior_fusion_scale=float(config.get("semantic_prior_fusion_scale", 1.0)),
+        semantic_prior_grayscale=bool(config.get("semantic_prior_grayscale", False)),
+        semantic_prior_grayscale_prob=float(config.get("semantic_prior_grayscale_prob", 0.0)),
         use_reference_memory=bool(config.get("use_reference_memory", True)),
         reference_tokens_per_frame=int(config.get("reference_tokens_per_frame", 32)),
         num_reference_frames=int(config.get("num_reference_frames", 2)),

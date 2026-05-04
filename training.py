@@ -677,6 +677,29 @@ def _normalize_compile_prefix_for_target(
     return state_dict
 
 
+def _load_state_dict_allowing_semantic_prior_delta(
+    target: nn.Module,
+    state_dict: Dict[str, torch.Tensor],
+) -> bool:
+    """Load strictly, except for adding/removing the optional semantic prior.
+
+    This keeps old checkpoint compatibility when a finetune enables
+    ``model.use_semantic_prior`` while still surfacing unrelated key drift.
+    Returns True when the relaxed semantic-prior-only path was used.
+    """
+    try:
+        target.load_state_dict(state_dict, strict=True)
+        return False
+    except RuntimeError as strict_error:
+        incompatible = target.load_state_dict(state_dict, strict=False)
+        missing = list(incompatible.missing_keys)
+        unexpected = list(incompatible.unexpected_keys)
+        semantic_only = all(k.startswith("semantic_prior.") for k in missing + unexpected)
+        if semantic_only:
+            return True
+        raise strict_error
+
+
 def maybe_compile_boundary_refine(
     model: nn.Module,
     model_cfg: Dict[str, Any],
@@ -721,17 +744,17 @@ def load_checkpoint(
 
     target = model.module if hasattr(model, "module") else model
     state_dict = _normalize_compile_prefix_for_target(ckpt["model"], target)
-    target.load_state_dict(state_dict, strict=True)
+    relaxed_semantic_prior = _load_state_dict_allowing_semantic_prior_delta(target, state_dict)
 
-    if "optimizer" in ckpt:
+    if "optimizer" in ckpt and not relaxed_semantic_prior:
         optimizer.load_state_dict(ckpt["optimizer"])
-    if "scheduler" in ckpt:
+    if "scheduler" in ckpt and not relaxed_semantic_prior:
         scheduler.load_state_dict(ckpt["scheduler"])
-    if scaler is not None and "scaler" in ckpt:
+    if scaler is not None and "scaler" in ckpt and not relaxed_semantic_prior:
         scaler.load_state_dict(ckpt["scaler"])
     if model_ema is not None:
         ema_state = ckpt.get("model_ema", ckpt.get("model_ema_state_dict"))
-        if ema_state is not None:
+        if ema_state is not None and not relaxed_semantic_prior:
             model_ema.load_state_dict(ema_state)
         else:
             model_ema.reset(model)
@@ -755,7 +778,7 @@ def load_model_weights_only(path: str, model: nn.Module, device: torch.device) -
 
     target = model.module if hasattr(model, "module") else model
     state_dict = _normalize_compile_prefix_for_target(state_dict, target)
-    target.load_state_dict(state_dict, strict=True)
+    _load_state_dict_allowing_semantic_prior_delta(target, state_dict)
     return ckpt_epoch, ckpt_global_step
 
 
@@ -1229,6 +1252,13 @@ def train() -> None:
     debug_console = _resolve_debug_console_enabled(cfg, args=args)
 
     train_cfg = cfg["train"]
+    if not args.resume and train_cfg.get("resume"):
+        args.resume = str(train_cfg["resume"])
+    if not args.resume_model_only:
+        args.resume_model_only = bool(train_cfg.get("resume_model_only", False))
+    if args.output_dir == "runs/memory_vmatte" and train_cfg.get("output_dir"):
+        args.output_dir = str(train_cfg["output_dir"])
+
     device = select_device(train_cfg)
     debug_console_enabled = bool(debug_console)
 

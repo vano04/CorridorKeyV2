@@ -16,6 +16,7 @@ if _PROJECT_ROOT in sys.path:
 sys.path.insert(0, _PROJECT_ROOT)
 
 from models import build_v3_hybrid_video_matting_model
+from models.semantic_prior import DinoStyleSemanticPrior
 from models.v3_hybrid_matting import _alpha_only_edge_refine, _input_residual_fg_base
 
 
@@ -121,7 +122,128 @@ def test_global_context_alpha_mode_zero_masks_seed():
     assert torch.count_nonzero(cond) == 0
 
 
-def test_input_residual_fg_mode_uses_native_input_base():
+def test_semantic_prior_outputs_and_fuses_global_tokens():
+    config = {
+        "patch_size": 8,
+        "embed_dims": [32, 64, 96, 128],
+        "depths": [1, 1, 1, 1],
+        "num_heads": [1, 2, 3, 4],
+        "global_context_dim": 64,
+        "global_context_layers": 1,
+        "global_context_heads": 4,
+        "global_context_tokens": 4,
+        "decoder_out_dim": 64,
+        "use_reference_memory": False,
+        "use_native_refiner": False,
+        "global_context_alpha_mode": "zero",
+        "use_semantic_prior": True,
+        "semantic_prior_dim": 64,
+        "semantic_prior_patch_size": 16,
+        "semantic_prior_layers": 1,
+        "semantic_prior_heads": 4,
+        "semantic_prior_tokens": 4,
+    }
+    model = build_v3_hybrid_video_matting_model(config)
+    global_video = torch.randn(1, 2, 3, 64, 64)
+    seed = torch.ones(1, 1, 64, 64)
+
+    tokens, semantic_logits = model.build_global_tokens(global_video, seed)
+
+    assert tokens.shape == (1, 4, 64)
+    assert semantic_logits is not None
+    assert semantic_logits.shape == (1, 2, 1, 64, 64)
+
+
+def test_semantic_prior_inherits_gradient_checkpointing_flag():
+    config = {
+        "patch_size": 8,
+        "embed_dims": [32, 64, 96, 128],
+        "depths": [1, 1, 1, 1],
+        "num_heads": [1, 2, 3, 4],
+        "global_context_dim": 64,
+        "global_context_layers": 1,
+        "global_context_heads": 4,
+        "global_context_tokens": 4,
+        "decoder_out_dim": 64,
+        "use_reference_memory": False,
+        "use_native_refiner": False,
+        "gradient_checkpointing": True,
+        "use_semantic_prior": True,
+        "semantic_prior_dim": 64,
+        "semantic_prior_patch_size": 16,
+        "semantic_prior_layers": 1,
+        "semantic_prior_heads": 4,
+        "semantic_prior_tokens": 4,
+    }
+    model = build_v3_hybrid_video_matting_model(config)
+
+    assert model.semantic_prior is not None
+    assert model.semantic_prior.gradient_checkpointing is True
+
+
+def test_semantic_prior_grayscale_feeds_replicated_luminance_to_patch_embed():
+    prior = DinoStyleSemanticPrior(
+        dim=32,
+        global_dim=32,
+        patch_size=8,
+        depth=1,
+        num_heads=4,
+        num_tokens=4,
+        grayscale_input=True,
+    )
+    seen = {}
+
+    def capture_input(_module, args):
+        seen["x"] = args[0].detach()
+
+    handle = prior.patch_embed.register_forward_pre_hook(capture_input)
+    try:
+        video = torch.rand(1, 2, 3, 32, 32)
+        prior(video)
+    finally:
+        handle.remove()
+
+    x = seen["x"]
+    assert torch.allclose(x[:, 0], x[:, 1])
+    assert torch.allclose(x[:, 1], x[:, 2])
+
+
+def test_semantic_prior_grayscale_prob_is_training_only():
+    prior = DinoStyleSemanticPrior(
+        dim=32,
+        global_dim=32,
+        patch_size=8,
+        depth=1,
+        num_heads=4,
+        num_tokens=4,
+        grayscale_prob=1.0,
+    )
+    seen = {}
+
+    def capture_input(_module, args):
+        seen["x"] = args[0].detach()
+
+    handle = prior.patch_embed.register_forward_pre_hook(capture_input)
+    try:
+        video = torch.zeros(1, 2, 3, 32, 32)
+        video[:, :, 0] = 1.0
+
+        prior.train()
+        prior(video)
+        train_x = seen["x"]
+        assert torch.allclose(train_x[:, 0], train_x[:, 1])
+        assert torch.allclose(train_x[:, 1], train_x[:, 2])
+
+        prior.eval()
+        prior(video)
+        eval_x = seen["x"]
+        assert not torch.allclose(eval_x[:, 0], eval_x[:, 1])
+        assert not torch.allclose(eval_x[:, 0], eval_x[:, 2])
+    finally:
+        handle.remove()
+
+
+def test_input_residual_fg_mode_blends_decoder_correction_into_input_base():
     device = torch.device("cpu")
     config = {
         "patch_size": 8,
@@ -148,7 +270,13 @@ def test_input_residual_fg_mode_uses_native_input_base():
 
     assert "decoder_fg_pred" in out
     assert "input_fg_base_pred" in out
-    assert torch.allclose(out["fg_pred"], out["input_fg_base_pred"], atol=1e-6)
+    assert "input_residual_blend_mask_pred" in out
+
+    blend = out["input_residual_blend_mask_pred"].expand_as(out["fg_pred"])
+    expected = torch.lerp(out["input_fg_base_pred"], out["decoder_fg_pred"], blend)
+    assert torch.allclose(out["fg_pred"], expected, atol=1e-6)
+    assert blend.amin() >= 0.0
+    assert blend.amax() <= 1.0
 
 
 def test_input_residual_despill_base_reduces_green_edge_halo():

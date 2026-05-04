@@ -13,22 +13,25 @@ Usage:
         --output-dir V3_output \
         --tile-size 1024 --temporal-frames 4
 
-Global context is built from a resolution-agnostic square canvas. Non-square
-frames are scaled to fit and centered in the global window so wide/tall inputs
-keep the same spatial frame of reference as 1024x1024 training windows.
+Global context is resized like the DINO-style finetune data path: the long side
+is capped while preserving aspect ratio, and optional global FG guidance is
+zero-filled by default for configs that only keep the channel for checkpoint
+compatibility.
 """
 from __future__ import annotations
 
 import argparse
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+from PIL import Image
 
 _HERE = Path(__file__).resolve().parent
 _PROJECT_ROOT = str(_HERE)
@@ -61,6 +64,7 @@ from Infer.inference import (
     _sorted_exr_files,
     _temporal_starts,
     _tile_weight,
+    _to_uint8_alpha,
     _write_comp_video,
     WindowTilePrefetcher,
     run_tiled_temporal_inference,
@@ -71,6 +75,14 @@ from models.v3_hybrid_matting import V3InferenceOptions
 
 
 _EPS = 1e-6
+_PREDICTION_MASK_OUTPUTS: Tuple[Tuple[str, str], ...] = (
+    ("semantic_fg_logits", "DinoSemantic"),
+    ("uncertainty_pred", "Uncertainty"),
+    ("spill_mask_pred", "SpillMask"),
+    ("input_residual_blend_mask_pred", "InputResidualBlendMask"),
+    ("alpha_only_refine_mask", "AlphaOnlyRefineMask"),
+    ("refine_mask", "RefineMask"),
+)
 
 
 def _letterbox_chw_to_square(
@@ -105,11 +117,30 @@ def _global_context_square_side(sequence: TiledExrSequence, cap: int) -> int:
     return min(requested, source_long)
 
 
+def _global_context_hw(sequence: TiledExrSequence, cap: int) -> Tuple[int, int]:
+    """Match training's DINO/global context resize: cap long side, preserve aspect."""
+    target_long = _global_context_square_side(sequence, cap)
+    source_h = int(sequence.info.height)
+    source_w = int(sequence.info.width)
+    source_long = max(source_h, source_w)
+    scale = target_long / float(max(1, source_long))
+    return (
+        max(1, int(round(source_h * scale))),
+        max(1, int(round(source_w * scale))),
+    )
+
+
+def _resize_chw_to_long_side(tensor: Tensor, out_hw: Tuple[int, int]) -> Tensor:
+    return _resize_chw_to(tensor, (int(out_hw[0]), int(out_hw[1])))
+
+
 def _build_pseudo_global_fg_guidance(video_global: Tensor, seed_global: Tensor, mode: str) -> Optional[Tensor]:
     """Build inference-time global FG guidance in the model's expected shape."""
     key = str(mode).strip().lower().replace("_", "-")
     if key in {"none", "off", "false", "0"}:
         return None
+    if key in {"zero", "zeros"}:
+        return torch.zeros_like(video_global)
     if key == "input":
         return video_global
     if key in {"masked-input", "alpha-masked-input", "premul-input"}:
@@ -188,12 +219,12 @@ def _run_v3_global_context(
     amp: bool,
     amp_dtype: torch.dtype,
     device: torch.device,
-) -> Tensor:
+) -> Tuple[Tensor, Optional[Tensor]]:
     """Compute global context tokens for a temporal window.
 
-    Returns: [B=1, M, C] global tokens.
+    Returns: ([B=1, M, C] global tokens, optional [T, 1, Hg, Wg] semantic logits).
     """
-    global_side = _global_context_square_side(sequence, global_long_side_cap)
+    global_hw = _global_context_hw(sequence, global_long_side_cap)
     full_frame = Tile(y0=0, y1=sequence.info.height, x0=0, x1=sequence.info.width)
     video_full, _, _ = sequence.read_window_tile(
         start=window_start,
@@ -201,15 +232,13 @@ def _run_v3_global_context(
         tile=full_frame,
     )
     video_global = torch.stack(
-        [_letterbox_chw_to_square(frame, global_side, fill=0.0) for frame in video_full],
+        [_resize_chw_to_long_side(frame, global_hw) for frame in video_full],
         dim=0,
     )
-    seed_global = _letterbox_chw_to_square(
+    seed_global = _resize_chw_to_long_side(
         seed_alpha_cpu,
-        global_side,
-        fill=0.0,
-        clamp=(0.0, 1.0),
-    )
+        global_hw,
+    ).clamp(0.0, 1.0)
     fg_guidance_global = _build_pseudo_global_fg_guidance(
         video_global,
         seed_global,
@@ -225,7 +254,13 @@ def _run_v3_global_context(
     )
 
     with _autocast_context(device, amp, amp_dtype):
-        if hasattr(model, "_build_global_input"):
+        if hasattr(model, "build_global_tokens"):
+            global_tokens, semantic_fg_logits = model.build_global_tokens(
+                video_dev,
+                seed_dev,
+                global_fg_guidance=fg_guidance_dev,
+            )
+        elif hasattr(model, "_build_global_input"):
             coarse_bc, green_priors, fg_guidance = model._build_global_input(
                 video_dev,
                 seed_dev,
@@ -237,9 +272,10 @@ def _run_v3_global_context(
                 green_priors_global=green_priors,
                 fg_guidance_global=fg_guidance,
             )
+            semantic_fg_logits = None
         else:
             coarse_bc = torch.zeros(
-                1, temporal_frames, 1, global_side, global_side,
+                1, temporal_frames, 1, global_hw[0], global_hw[1],
                 device=device, dtype=video_dev.dtype,
             )
             coarse_bc[:, 0] = seed_dev
@@ -257,8 +293,77 @@ def _run_v3_global_context(
                 green_priors_global=green_priors,
                 fg_guidance_global=fg_guidance_dev,
             )
+            semantic_fg_logits = None
 
-    return global_tokens
+    semantic_cpu = (
+        semantic_fg_logits[0].detach().cpu().to(torch.float32)
+        if semantic_fg_logits is not None
+        else None
+    )
+    return global_tokens, semantic_cpu
+
+
+def _mask_to_display(mask: Tensor, key: str) -> Tensor:
+    mask = mask.detach().cpu().to(torch.float32)
+    if key.endswith("_logits") or key.endswith("_logit"):
+        mask = mask.sigmoid()
+    return mask.clamp(0.0, 1.0)
+
+
+def _save_single_prediction_mask(
+    *,
+    output_dir: Path,
+    dir_name: str,
+    key: str,
+    index: int,
+    mask: Tensor,
+) -> None:
+    path = output_dir / dir_name
+    path.mkdir(parents=True, exist_ok=True)
+    stem = f"{index:05d}"
+    Image.fromarray(_to_uint8_alpha(_mask_to_display(mask, key)), mode="L").save(
+        path / f"{dir_name.lower()}_{stem}.png"
+    )
+
+
+def _save_prediction_masks(
+    mask_pred: Dict[str, Tensor],
+    output_dir: Path,
+    workers: int,
+) -> None:
+    tasks: List[Tuple[str, str, int, Tensor]] = []
+    for key, dir_name in _PREDICTION_MASK_OUTPUTS:
+        masks = mask_pred.get(key)
+        if masks is None:
+            continue
+        for index in range(int(masks.shape[0])):
+            tasks.append((key, dir_name, index, masks[index]))
+    if not tasks:
+        return
+    if workers <= 1:
+        for key, dir_name, index, mask in tasks:
+            _save_single_prediction_mask(
+                output_dir=output_dir,
+                dir_name=dir_name,
+                key=key,
+                index=index,
+                mask=mask,
+            )
+        return
+    with ThreadPoolExecutor(max_workers=max(1, int(workers))) as pool:
+        futures = [
+            pool.submit(
+                _save_single_prediction_mask,
+                output_dir=output_dir,
+                dir_name=dir_name,
+                key=key,
+                index=index,
+                mask=mask,
+            )
+            for key, dir_name, index, mask in tasks
+        ]
+        for future in as_completed(futures):
+            future.result()
 
 
 @torch.inference_mode()
@@ -278,10 +383,10 @@ def run_v3_tiled_inference(
     amp: bool = True,
     amp_dtype: torch.dtype = torch.bfloat16,
     device: torch.device = torch.device("cuda"),
-) -> Tuple[Tensor, Tensor]:
+) -> Tuple[Tensor, Tensor, Dict[str, Tensor]]:
     """Run V3 tiled temporal inference.
 
-    Returns: (alpha_pred, fg_pred) both [N_frames, C, H, W] on CPU.
+    Returns: (alpha_pred, fg_pred, mask_pred) on CPU.
     """
     n_frames = len(sequence.paths)
     h = sequence.info.height
@@ -295,6 +400,10 @@ def run_v3_tiled_inference(
     w_pad = max(w, tile_size)
     alpha_sum = torch.zeros((n_frames, 1, h, w), dtype=torch.float32)
     fg_sum = torch.zeros((n_frames, 3, h, w), dtype=torch.float32)
+    mask_sums: Dict[str, Tensor] = {}
+    mask_counts: Dict[str, Tensor] = {}
+    semantic_sum: Optional[Tensor] = None
+    semantic_count: Optional[Tensor] = None
     count = torch.zeros((n_frames, 1, 1, 1), dtype=torch.float32)
 
     carry_seed = alpha_hint
@@ -314,9 +423,10 @@ def run_v3_tiled_inference(
 
         # Compute global context if enabled
         global_tokens = None
+        semantic_logits_win = None
         if use_global_context:
             t0 = time.perf_counter()
-            global_tokens = _run_v3_global_context(
+            global_tokens, semantic_logits_global = _run_v3_global_context(
                 model=model,
                 sequence=sequence,
                 window_start=start,
@@ -328,6 +438,20 @@ def run_v3_tiled_inference(
                 amp_dtype=amp_dtype,
                 device=device,
             )
+            if semantic_logits_global is not None:
+                semantic_logits_win = F.interpolate(
+                    semantic_logits_global[:actual],
+                    size=(h, w),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                if semantic_sum is None:
+                    semantic_sum = torch.zeros((n_frames, 1, h, w), dtype=torch.float32)
+                    semantic_count = torch.zeros((n_frames, 1, 1, 1), dtype=torch.float32)
+                for local_t in range(actual):
+                    global_t = start + local_t
+                    semantic_sum[global_t] += semantic_logits_win[local_t]
+                    semantic_count[global_t] += 1.0
             dt_global = time.perf_counter() - t0
         else:
             dt_global = 0.0
@@ -336,6 +460,7 @@ def run_v3_tiled_inference(
         t0_tiles = time.perf_counter()
         alpha_acc = torch.zeros((temporal_frames, 1, h_pad, w_pad), dtype=torch.float32, device="cpu")
         fg_acc = torch.zeros((temporal_frames, 3, h_pad, w_pad), dtype=torch.float32, device="cpu")
+        mask_acc: Dict[str, Tensor] = {}
         weight_acc = torch.zeros((temporal_frames, 1, h_pad, w_pad), dtype=torch.float32, device="cpu")
 
         for tile in tiles:
@@ -369,6 +494,21 @@ def run_v3_tiled_inference(
 
             alpha_tile = out["alpha_pred"][0].detach().cpu().clamp(0.0, 1.0).to(torch.float32)
             fg_tile = out["fg_pred"][0].detach().cpu().to(torch.float32)
+            mask_tiles: Dict[str, Tensor] = {}
+            for key, _ in _PREDICTION_MASK_OUTPUTS:
+                value = out.get(key)
+                if value is None:
+                    continue
+                tile_value = value[0].detach().cpu().to(torch.float32)
+                if tile_value.ndim != 4 or tile_value.shape[-2:] != alpha_tile.shape[-2:]:
+                    continue
+                if key not in mask_acc:
+                    mask_acc[key] = torch.zeros(
+                        (temporal_frames, int(tile_value.shape[1]), h_pad, w_pad),
+                        dtype=torch.float32,
+                        device="cpu",
+                    )
+                mask_tiles[key] = tile_value
             if merge_mode == "crop":
                 core = _tile_core_bounds(
                     tile=tile,
@@ -382,11 +522,15 @@ def run_v3_tiled_inference(
                 lx0, lx1 = core.x0 - tile.x0, core.x1 - tile.x0
                 alpha_acc[:, :, core.y0:core.y1, core.x0:core.x1] = alpha_tile[:, :, ly0:ly1, lx0:lx1]
                 fg_acc[:, :, core.y0:core.y1, core.x0:core.x1] = fg_tile[:, :, ly0:ly1, lx0:lx1]
+                for key, mask_tile in mask_tiles.items():
+                    mask_acc[key][:, :, core.y0:core.y1, core.x0:core.x1] = mask_tile[:, :, ly0:ly1, lx0:lx1]
                 weight_acc[:, :, core.y0:core.y1, core.x0:core.x1] = 1.0
             else:
                 weight = _tile_weight(tile, h_pad, w_pad, tile_overlap, torch.device("cpu"))
                 alpha_acc[:, :, tile.y0:tile.y1, tile.x0:tile.x1] += alpha_tile * weight
                 fg_acc[:, :, tile.y0:tile.y1, tile.x0:tile.x1] += fg_tile * weight
+                for key, mask_tile in mask_tiles.items():
+                    mask_acc[key][:, :, tile.y0:tile.y1, tile.x0:tile.x1] += mask_tile * weight
                 weight_acc[:, :, tile.y0:tile.y1, tile.x0:tile.x1] += weight
 
             del video_dev, seed_dev, valid_mask_dev, out
@@ -396,11 +540,24 @@ def run_v3_tiled_inference(
         weight_acc = weight_acc.clamp_min(_EPS)
         alpha_win = (alpha_acc / weight_acc)[:actual, :, :h, :w]
         fg_win = (fg_acc / weight_acc)[:actual, :, :h, :w]
+        mask_wins = {
+            key: (value / weight_acc)[:actual, :, :h, :w]
+            for key, value in mask_acc.items()
+        }
 
         for local_t in range(actual):
             global_t = start + local_t
             alpha_sum[global_t] += alpha_win[local_t]
             fg_sum[global_t] += fg_win[local_t]
+            for key, mask_win in mask_wins.items():
+                if key not in mask_sums:
+                    mask_sums[key] = torch.zeros(
+                        (n_frames, int(mask_win.shape[1]), h, w),
+                        dtype=torch.float32,
+                    )
+                    mask_counts[key] = torch.zeros((n_frames, 1, 1, 1), dtype=torch.float32)
+                mask_sums[key][global_t] += mask_win[local_t]
+                mask_counts[key][global_t] += 1.0
             count[global_t] += 1.0
 
         if start_i + 1 < len(starts):
@@ -419,7 +576,13 @@ def run_v3_tiled_inference(
         )
 
     count = count.clamp_min(1.0)
-    return (alpha_sum / count).clamp(0.0, 1.0), fg_sum / count
+    mask_pred = {
+        key: (value / mask_counts[key].clamp_min(1.0)).clamp(0.0, 1.0)
+        for key, value in mask_sums.items()
+    }
+    if semantic_sum is not None and semantic_count is not None:
+        mask_pred["semantic_fg_logits"] = semantic_sum / semantic_count.clamp_min(1.0)
+    return (alpha_sum / count).clamp(0.0, 1.0), fg_sum / count, mask_pred
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -446,12 +609,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--global-fg-guidance",
-        choices=("masked-input", "input", "none"),
+        choices=("masked-input", "input", "zero", "none"),
         default="none",
         help=(
-            "Inference-time global FG guidance. 'none' matches alpha-first "
-            "finetunes without global FG sidecars; 'masked-input' uses global "
-            "RGB multiplied by the current alpha seed; 'input' uses raw global RGB."
+            "Inference-time global FG guidance. 'none' lets models that declare "
+            "use_global_fg_guidance zero-fill the sidecar, matching finetune_dino; "
+            "'zero' passes explicit zeros; 'masked-input' uses global RGB multiplied "
+            "by the current alpha seed; 'input' uses raw global RGB."
         ),
     )
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
@@ -541,7 +705,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         flush=True,
     )
 
-    alpha_pred, fg_pred = run_v3_tiled_inference(
+    alpha_pred, fg_pred, mask_pred = run_v3_tiled_inference(
         model=model,
         sequence=sequence,
         initial_alpha_cpu=alpha_cpu,
@@ -572,6 +736,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         fg_source=args.fg_source,
         workers=args.write_threads,
     )
+    _save_prediction_masks(mask_pred, args.output_dir, workers=args.write_threads)
 
     if args.make_video:
         video_path = args.output_dir / "comp.mp4"

@@ -873,6 +873,7 @@ class DeviceMattingTransform(nn.Module):
             if global_fg is not None:
                 out["global_fg_gt"] = global_fg
             out["global_video_rgb"] = global_input_gt if global_input_gt is not None else global_fg
+            out["global_alpha_gt"] = global_alpha
             out["global_coarse_alpha_init"] = global_coarse
             out["tile_coords"] = tile_coords
             out["source_hw"] = source_hw

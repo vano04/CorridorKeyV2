@@ -1,10 +1,16 @@
-# Alpha-first finetune config.
+# DINO-style semantic-prior finetune config.
 #
 # Derived from v3_single_5090_fp8_alt_1024.yaml for continuing from existing
 # checkpoints while shifting foreground handling away from low-res decoder FG.
 # The fg_head module remains enabled for checkpoint compatibility, but
 # fg_prediction_mode=input_residual makes the active FG path:
 #   input_rgb * alpha_pred + native RGB residual/despill correction.
+#
+# This is intended to initialize from:
+#   runs/native_context_switch/checkpoint_interrupted_step003570.pt
+# Use resume_model_only/fresh schedule because the semantic_prior.* module is
+# new and should start from random init while the existing matting weights are
+# reused.
 
 model:
   patch_size: 8
@@ -54,6 +60,11 @@ model:
   semantic_prior_tokens: 64
   semantic_prior_dropout: 0.05
   semantic_prior_fusion_scale: 1.0
+  # Randomly train the DINO-style semantic prior on luminance, but keep RGB at
+  # inference time. This discourages "green == background" without removing
+  # useful chroma cues during eval.
+  semantic_prior_grayscale: false
+  semantic_prior_grayscale_prob: 0.5
 
   use_reference_memory: true
   reference_tokens_per_frame: 32
@@ -127,6 +138,9 @@ data:
   pin_memory: true
 
 train:
+  output_dir: runs/finetune_dino
+  resume: runs/native_context_switch/checkpoint_interrupted_step003570.pt
+  resume_model_only: true
   epochs: 12
   lr: 2.0e-6
   weight_decay: 0.01

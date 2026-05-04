@@ -128,9 +128,36 @@ def test_all_loss_components_present(model_and_device):
         "comp_random_bg", "coarse_alpha_l1", "coarse_fg_l1",
         "native_alpha_delta_reg", "native_fg_delta_reg", "uncertainty", "quality_eval",
         "green_bg_alpha_suppress", "green_bg_alpha_suppress_abs", "green_bg_pixels",
+        "semantic_prior_bce", "semantic_prior_dice",
     }
     for k in expected_keys:
         assert k in items, f"Missing loss component: {k}"
+
+
+def test_semantic_prior_loss_uses_global_alpha_target():
+    criterion = V3MattingLossComputer(
+        weights={"semantic_prior_bce": 1.0, "semantic_prior_dice": 1.0},
+        fg_representation="premul",
+    )
+    pred = {
+        "alpha_pred": torch.zeros(1, 1, 1, 8, 8),
+        "fg_pred": torch.zeros(1, 1, 3, 8, 8),
+        "comp_pred": torch.zeros(1, 1, 3, 8, 8),
+        "semantic_fg_logits": torch.zeros(1, 1, 1, 16, 16),
+    }
+    batch = {
+        "alpha_gt": torch.zeros(1, 1, 1, 8, 8),
+        "fg_gt": torch.zeros(1, 1, 3, 8, 8),
+        "video_rgb": torch.zeros(1, 1, 3, 8, 8),
+        "input_gt": torch.zeros(1, 1, 3, 8, 8),
+        "global_alpha_gt": torch.ones(1, 1, 1, 16, 16),
+    }
+
+    total, items = criterion(pred, batch)
+
+    assert torch.isfinite(total)
+    assert items["semantic_prior_bce"] > 0
+    assert items["semantic_prior_dice"] > 0
 
 
 def test_green_background_alpha_suppression_targets_zero_alpha(model_and_device):
